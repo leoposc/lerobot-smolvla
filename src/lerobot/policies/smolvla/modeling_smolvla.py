@@ -540,7 +540,7 @@ def pad_tensor(tensor, max_len, pad_value=0):
 
 class VLAFlowMatching(nn.Module):
     """
-    SmolVLA
+    SmolVLA 
 
     [Paper]()
 
@@ -564,6 +564,12 @@ class VLAFlowMatching(nn.Module):
     └──────────────────────────────┘
     """
 
+    """
+        The __init__() builds the action-expert part and small projection layers 
+        that connect it to the rest of the model. 
+        - Stores 
+
+    """
     def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
@@ -629,6 +635,8 @@ class VLAFlowMatching(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
+
+        Called by forward() and sample_actions()
         """
         embs = []
         pad_masks = []
@@ -816,12 +824,23 @@ class VLAFlowMatching(nn.Module):
             actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
             noise = self.sample_noise(actions_shape, device)
 
+        # Turn image, language and state into conditioning representation for the action-generation process
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+
+        # determine which tokens are allowed to attend to which other tokens -> tells the transformer how information
+        # is allowed to flow between the different parts of the input. 
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks) 
+        # generate position ids 
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        # Compute image and language key value cache
+        """ 
+            Compute image and language key value cache.
+
+            The KV cache is reused for every timestep of the action chunk generation process, since 
+            the observation doesn't change during the action chunk generation. 
+
+        """
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
