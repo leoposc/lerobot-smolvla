@@ -70,6 +70,49 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
     return hidden_dim
 
+"""
+       IMAGE ──────► Vision Encoder ──┐
+                                      │
+       LANGUAGE ──────────────────────┤
+                                      ▼
+       STATE ──► state_proj ─────► VLM STREAM
+                                      │
+                              self-attention
+                                      │
+                              self-attention
+                                      │
+                              self-attention
+                                      │
+                               K/V CACHE
+                                      │
+                 ┌────────────────────┘
+                 │
+                 │        ACTION STREAM
+                 │              │
+                 │          noisy actions
+                 │              │
+                 │              ▼
+                 │         ┌───────────┐
+                 │         │ Self-attn │
+                 │         └─────┬─────┘
+                 │               │
+                 │         ┌─────▼─────┐
+                 └────────►│ Cross-attn│
+                           └─────┬─────┘
+                                 │
+                           ┌─────▼─────┐
+                           │ Self-attn │
+                           └─────┬─────┘
+                                 │
+                           ┌─────▼─────┐
+                    ┌─────►│ Cross-attn│
+                    │      └─────┬─────┘
+                    │            │
+                    └────────────┘
+                                 │
+                                 ▼
+                         action prediction
+"""
 
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
@@ -217,6 +260,26 @@ class SmolVLMWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
 
+    """
+        Take the current embeddings, perform one transformer attention layer and returns
+        the resulting attention output. 
+
+        @parameters:
+            - inputs_embeds:    [VLM embeddings, Expert embeddings]
+                                During the initial prefix processing the Expert embeddings can be None 
+            - past_key_values:  Stores the K/V tensors for each transformer so they do not have to be recomputed. 
+              
+                                DynamicCache
+                                A cache that grows dynamically as more tokens are generated. This is the default
+                                for generative models. It stores the key and value states as a list of `CacheLayer`,
+                                one for each layer. The expected shape for each tensor in the `CacheLayer`s is
+                                `[batch_size, num_heads, seq_len, head_dim]`. If a config is passed, it will
+                                additionally check for sliding or hybrid cache structure, greatly reducing the
+                                memory requirement of the cached tensors to 
+                                `[batch_size, num_heads, min(seq_len, sliding_window), head_dim]`.
+                                DynamicCache.update()
+                                Concats the new keys/ values to the existing cache. Extends the seq_len. 
+    """
     def forward_attn_layer(
         self,
         model_layers,
@@ -266,6 +329,8 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_mask_ = _attention_mask
         position_ids_ = _position_ids
 
+        # RoPE modifies the mechanism that decides where to look (Q/K), not the 
+        # information that is retrieved (V). Therefore RoPE is only applied to Q/K.
         query_states = apply_rope(query_states, position_ids_)
         key_states = apply_rope(key_states, position_ids_)
 
@@ -274,6 +339,8 @@ class SmolVLMWithExpertModel(nn.Module):
             # [batch, seq, heads, head_dim]. During prefix prefill this stores the (post-RoPE) K/V and
             # returns them unchanged; during denoising it appends the suffix K/V and returns
             # [prefix; suffix], exactly like the previous hand-rolled dict cache.
+            # This module: [B, S, H, D]
+            # DynamicCache: [B, H, S, D]
             key_states, value_states = past_key_values.update(
                 key_states.transpose(1, 2), value_states.transpose(1, 2), layer_idx
             )
@@ -441,6 +508,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 or "cross" not in self.attention_mode
                 or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
             ):
+                # perform self-attention
                 att_outputs, past_key_values = self.forward_attn_layer(
                     model_layers,
                     inputs_embeds,
@@ -453,6 +521,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     past_key_values=past_key_values,
                 )
             else:
+                # perform cross attention 
                 att_outputs, past_key_values = self.forward_cross_attn_layer(
                     model_layers,
                     inputs_embeds,
@@ -512,6 +581,10 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_interface = self.eager_attention_forward
         return attention_interface
 
+    """
+        Standard scaled dot-product multi-head attention with one extra step for 
+        Grouped Query Attention (GQA). 
+    """
     def eager_attention_forward(
         self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
     ):
@@ -551,6 +624,7 @@ class SmolVLMWithExpertModel(nn.Module):
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
         probs = probs.to(dtype=value_states.dtype)
 
+        # Multiply attention probabilites by V
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
 
         att_output = att_output.permute(0, 2, 1, 3)
