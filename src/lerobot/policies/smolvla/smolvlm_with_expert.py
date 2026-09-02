@@ -70,49 +70,6 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
     return hidden_dim
 
-"""
-       IMAGE ──────► Vision Encoder ──┐
-                                      │
-       LANGUAGE ──────────────────────┤
-                                      ▼
-       STATE ──► state_proj ─────► VLM STREAM
-                                      │
-                              self-attention
-                                      │
-                              self-attention
-                                      │
-                              self-attention
-                                      │
-                               K/V CACHE
-                                      │
-                 ┌────────────────────┘
-                 │
-                 │        ACTION STREAM
-                 │              │
-                 │          noisy actions
-                 │              │
-                 │              ▼
-                 │         ┌───────────┐
-                 │         │ Self-attn │
-                 │         └─────┬─────┘
-                 │               │
-                 │         ┌─────▼─────┐
-                 └────────►│ Cross-attn│
-                           └─────┬─────┘
-                                 │
-                           ┌─────▼─────┐
-                           │ Self-attn │
-                           └─────┬─────┘
-                                 │
-                           ┌─────▼─────┐
-                    ┌─────►│ Cross-attn│
-                    │      └─────┬─────┘
-                    │            │
-                    └────────────┘
-                                 │
-                                 ▼
-                         action prediction
-"""
 
 class SmolVLMWithExpertModel(nn.Module):
     def __init__(
