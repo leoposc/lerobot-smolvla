@@ -594,6 +594,7 @@ class SmolVLMWithExpertModel(nn.Module):
 
         sequence_length = key_states.shape[1]
 
+        # insert a dimension [B, S, num_heads, head_dim] -> [B, S; num_heads, num_key_value_groups, head_dim]
         key_states = key_states[:, :, :, None, :].expand(
             batch_size, sequence_length, num_key_value_heads, num_key_value_groups, head_dim
         )
@@ -611,21 +612,22 @@ class SmolVLMWithExpertModel(nn.Module):
         # Attention here is upcasted to float32 to match the original eager implementation.
         query_states = query_states.to(dtype=torch.float32)
         key_states = key_states.to(dtype=torch.float32)
-
+        # Rearrange to [B, H, S, D]
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
 
+        # Every query token gets a score for every key token
         att_weights = torch.matmul(query_states, key_states.transpose(2, 3))
         att_weights *= head_dim**-0.5
 
         att_weights = att_weights.to(dtype=torch.float32)
         big_neg = torch.finfo(att_weights.dtype).min  # -2.3819763e38  # See gemma/modules.py
-        masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
-        probs = nn.functional.softmax(masked_att_weights, dim=-1)
+        masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg) # apply attention mask 
+        probs = nn.functional.softmax(masked_att_weights, dim=-1) # compute softmax
         probs = probs.to(dtype=value_states.dtype)
 
         # Multiply attention probabilites by V
-        att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))
+        att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3)) # change to [B, H, S, D]
 
         att_output = att_output.permute(0, 2, 1, 3)
         # we use -1 because sequence length can change
