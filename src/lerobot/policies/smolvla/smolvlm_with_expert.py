@@ -252,6 +252,7 @@ class SmolVLMWithExpertModel(nn.Module):
         query_states = []
         key_states = []
         value_states = []
+        # loop through VLM and Action layer 
         for i, hidden_states in enumerate(inputs_embeds):
             layer = model_layers[i][layer_idx]
             if hidden_states is None or layer is None:
@@ -311,6 +312,20 @@ class SmolVLMWithExpertModel(nn.Module):
         )
         return [att_output], past_key_values
 
+    """
+        Function handles 2 different attention operations:
+            1. VLM self-attention on the prefix - only in the special prefix case. 
+            2. Expert -> VLM cross-attention - important part during action generation. 
+
+        Cross attention:
+            - Expert provides Queries 
+            - VLM provides Keys/ Values
+
+
+        @params:
+            inputs_embeds[1]:      contains action tokens
+        
+    """
     def forward_cross_attn_layer(
         self,
         model_layers,
@@ -364,13 +379,15 @@ class SmolVLMWithExpertModel(nn.Module):
             # layer goes through `forward_attn_layer`, which stores the (post-RoPE) VLM K/V for this
             # layer index. Here we only read them back (no concatenation: the expert cross-attends to
             # the fixed prefix). `DynamicCache` stores [batch, heads, seq, head_dim]; transpose back.
+            
+            # Retrieve the VLM K/V from the cache
             key_states = past_key_values.layers[layer_idx].keys.transpose(1, 2)
             value_states = past_key_values.layers[layer_idx].values.transpose(1, 2)
 
         # Expert
         expert_layer = model_layers[1][layer_idx]
         if expert_layer is not None:
-            expert_hidden_states = expert_layer.input_layernorm(inputs_embeds[1])
+            expert_hidden_states = expert_layer.input_layernorm(inputs_embeds[1]) # input_embeds[1] contains the action tokens
 
             expert_input_shape = expert_hidden_states.shape[:-1]
             expert_hidden_shape = (*expert_input_shape, -1, expert_layer.self_attn.head_dim)
@@ -459,6 +476,7 @@ class SmolVLMWithExpertModel(nn.Module):
         # RMSNorm
         num_layers = self.num_vlm_layers
         head_dim = self.vlm.config.text_config.head_dim
+        # loop through every layer (default: 16)
         for layer_idx in range(num_layers):
             if (
                 fill_kv_cache
