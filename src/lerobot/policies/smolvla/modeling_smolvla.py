@@ -162,20 +162,25 @@ def aloha_gripper_from_angular_inv(value):
  |                |      '------------------'               |
  |                |                                         |
  |                ▼                                         |
- |     SmolVLAPolicy                                        |
- |     |- prepare_images()                                  |
- |     |- prepare_state()                                   |
- |     |- prepare_action()                                  |
- |     |                                                    |
- |     ▼                                                    |
- |     VLAFlowMatching                                      |
- |     |- forward()        ◄- training                      |
- |     |- sample_actions() ◄- inference                     |
+ |    .-------------.
+ |    |SmolVLAPolicy|                                       |
+ |    '-------------'                                       |
+ |  .-►|- prepare_images() ◄---------------------------.    |
+ |  |-►|- prepare_state()  ◄---------------------------|    |
+ |  |-►|- prepare_action()                             |    |
+ |  |  |                                               |    |
+ |  |  |- predict_action_chunk()/ select_action()---.  |    |
+ |  '--|- forward()----------------.                |  |    |
+ |     |                           |                |  |    |
+ |     ▼                           |    get_action_chunk()  |
+ |     VLAFlowMatching             ▼                |       |
+ |     |- forward()◄----------training              |       |
+ |     |- sample_actions()◄---inference ◄-----------'       |
  |     ▼                                                    |
  |     action chunk                                         |
  |     |                                                    |
- |     ▼                                                    |
- |     select_action() -► single action -► robot execution  |
+ |     |                                                    |
+ |     '--► robot execution                                 |
  |                                                          |
  '----------------------------------------------------------'
 
@@ -315,8 +320,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
     ) -> Tensor:
         """Select a single action given environment observations.
 
-        This method wraps `select_actions` in order to return one action at a time for execution in the
-        environment. It works by managing the actions in a queue and only calling `select_actions` when the
+        This method wraps `_get_action_chunk()` in order to return one action at a time for execution in the
+        environment. It works by managing the actions in a queue and only calling `_get_action_chunk()` when the
         queue is empty.
         """
 
@@ -806,6 +811,21 @@ class VLAFlowMatching(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
+    """
+        This function is used during inference to sample a chunk of future actions given the current robot observations.
+        It uses the Euler integration method to iteratively denoise the sampled noise and generate a sequence of actions.
+
+        Args:
+            images: List of image tensors (batch_size x num_images x channels x height x width).
+            img_masks: List of image padding masks (batch_size x num_images).
+            lang_tokens: Language tokens tensor (batch_size x seq_len).
+            lang_masks: Language attention masks tensor (batch_size x seq_len).
+            state: Robot state tensor (batch_size x state_dim).
+            noise: Optional noise tensor for flow matching. If None, it will be sampled.
+            **kwargs: Additional keyword arguments for RTC processing.
+        Returns:
+            Tensor: Sampled actions (batch_size x num_steps x num_motors).
+    """
     def sample_actions(
         self,
         images,
@@ -816,7 +836,6 @@ class VLAFlowMatching(nn.Module):
         noise=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = state.shape[0]
         device = state.device
 
