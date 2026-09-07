@@ -17,44 +17,45 @@ Flow matching does not solve ODEs analytically, instead we take small numerical 
 
 ## Flow Matching Design Choices
 
-```text
-SOURCE DISTRIBUTION
-      │
-      │  $x_0 ~ p_0$
-      ▼
-┌──────────────────────┐
-│  1. Coupling         │  How do $x_0$ and $x_1$ correspond?
-└──────────────────────┘
-      │
-      ▼
-┌──────────────────────┐
-│  2. Probability path │  How do we get from $x_0 -> x_1$ ?
-└──────────────────────┘
-      │
-      ▼
-┌──────────────────────┐
-│  3. Target vector    │  What velocity should the model learn?
-│     field            │
-└──────────────────────┘
-      │
-      ▼
-┌──────────────────────┐
-│  4. Neural network   │  $v_\theta (x,t)$
-└──────────────────────┘
-      │
-      ▼
-┌──────────────────────┐
-│  5. Training         │  How is $v \theta$ optimized?
-└──────────────────────┘
-      │
-      ▼
-┌──────────────────────┐
-│  6. ODE solver       │  How do we generate samples?
-└──────────────────────┘
-      │
-      ▼
-   $x_1 ~ pdata$
-```
+### Flow Matching pipeline
+
+**Source distribution**
+
+$x_0 \sim p_0$
+
+↓
+
+**1. Coupling**  
+How do $x_0$ and $x_1$ correspond?
+
+↓
+
+**2. Probability path**  
+How do we get from $x_0 \rightarrow x_1$?
+
+↓
+
+**3. Target vector field**  
+What velocity should the model learn?
+
+↓
+
+**4. Neural network**  
+$v_\theta(x,t)$
+
+↓
+
+**5. Training**  
+How is $v_\theta$ optimized?
+
+↓
+
+**6. ODE solver**  
+How do we generate samples?
+
+↓
+
+$x_1 \sim p_{\mathrm{data}}$
 
 
 #### Historical foundation
