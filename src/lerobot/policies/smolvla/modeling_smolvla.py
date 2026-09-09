@@ -173,7 +173,9 @@ def aloha_gripper_from_angular_inv(value):
  |  '--|- forward()----------------.                |  |    |
  |     |                           |                |  |    |
  |     ▼                           |    get_action_chunk()  |
- |     VLAFlowMatching             ▼                |       |
+ |    .---------------.            |                |       |
+ |    |VLAFlowMatching|            |                |       |
+ |    '---------------'            ▼                |       |
  |     |- forward()◄----------training              |       |
  |     |- sample_actions()◄---inference ◄-----------'       |
  |     ▼                                                    |
@@ -323,6 +325,10 @@ class SmolVLAPolicy(PreTrainedPolicy):
         This method wraps `_get_action_chunk()` in order to return one action at a time for execution in the
         environment. It works by managing the actions in a queue and only calling `_get_action_chunk()` when the
         queue is empty.
+
+
+        Noise is always None when being called from lerobot_eval.py
+        Only the preprocessed observations are passed as batch into this function. 
         """
 
         assert not self._rtc_enabled(), (
@@ -805,17 +811,18 @@ class VLAFlowMatching(nn.Module):
             use_cache=False,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        # Original openpi code, upcast attention output
+        # original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
 
     """
-        This function is used during inference to sample a chunk of future actions given the current robot observations.
-        It uses the Euler integration method to iteratively denoise the sampled noise and generate a sequence of actions.
+        this function is used during inference to sample a chunk of future actions given the current robot observations.
+        it uses the Euler integration method to iteratively denoise the sampled noise and generate a sequence of actions.
 
-        Args:
+        Calling frequency: every timestep t (and if action queue is empty)
+        args:
             images: List of image tensors (batch_size x num_images x channels x height x width).
             img_masks: List of image padding masks (batch_size x num_images).
             lang_tokens: Language tokens tensor (batch_size x seq_len).
@@ -823,8 +830,8 @@ class VLAFlowMatching(nn.Module):
             state: Robot state tensor (batch_size x state_dim).
             noise: Optional noise tensor for flow matching. If None, it will be sampled.
             **kwargs: Additional keyword arguments for RTC processing.
-        Returns:
-            Tensor: Sampled actions (batch_size x num_steps x num_motors).
+        returns:
+            tensor: Sampled actions (batch_size x num_steps x num_motors).
     """
     def sample_actions(
         self,
@@ -856,12 +863,14 @@ class VLAFlowMatching(nn.Module):
         """ 
             Compute image and language key value cache.
 
-            The KV cache is reused for every timestep of the action chunk generation process, since 
-            the observation doesn't change during the action chunk generation. 
+
+            The KV cache is reused for every Tau timestep of the action chunk generation process, since 
+            the observation doesn't change during the action chunk generation. KV cache is set to None
+            for new observation timesteps t. 
 
         """
         _, past_key_values = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks,
+            attention_mask=prefix_att_2d_masks, 
             position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_embs, None],

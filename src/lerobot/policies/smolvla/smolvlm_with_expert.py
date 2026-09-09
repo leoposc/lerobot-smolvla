@@ -448,6 +448,40 @@ class SmolVLMWithExpertModel(nn.Module):
             expert_layers.append(expert_layer)
         return [vlm_layers, expert_layers]
 
+    """
+        ============================== DURING INFERENCE ======================
+        @call_frequency: for every obs timestep t AND if the action queue is
+        empty this function is called once + num_steps (specified in config) 
+
+        @brief: During inference, this function first fills up the KV cache 
+        of the VLM by performing self-attention on the prefix embeddings on 
+        every layer. Then, for every denoising step, it performs self- and 
+        cross-attention for every layer of the Action Expert, where the queries
+        come from the Action Expert and the keys/values come from the VLM.
+
+        @params: 
+        - attention_mask: prefix_att_2d_masks. Constant for each ob 
+          timestep t.
+        - position_ids: prefix_position_ids. Constant for each obs timestep t.
+        - past_key_values: None for the first run, then it is filled and used
+          for `num_steps` of the denoising process.  
+        - input_embeds: [prefix_embeddings, None] for filling up the KV cache, 
+          then [None, action_embeddings] for the denoising process. Output_emb 
+          become the input_emb for the next layer. 
+
+        - use_cache: SmolVLAConfig.use_cache (true)
+
+
+        ============================= DURING TRAINING ========================
+        @call_frequency: 
+        @params: 
+        - attention_mask: 
+        - position_ids: 
+        - past_key_values: 
+        - input_embeds: [prefix_embs, suffix_embs] 
+        - use_cache:
+
+    """
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -469,6 +503,7 @@ class SmolVLMWithExpertModel(nn.Module):
         # Prefix prefill: no cache was passed, so create one and fill it (every layer runs
         # self-attention over the prefix). When a filled cache is passed (denoising), layers
         # read from it instead.
+        # During inference, fill_kv_cache is True
         fill_kv_cache = use_cache and past_key_values is None
         if fill_kv_cache:
             past_key_values = DynamicCache()
@@ -510,28 +545,34 @@ class SmolVLMWithExpertModel(nn.Module):
                 )
             outputs_embeds = []
             start = 0
+            # hidden_states represents the model's current learned representations
+            # hidden_state(batch_size, number_of_tokens, n-dimensional embedding vector)
             for i, hidden_states in enumerate(inputs_embeds):
                 layer = model_layers[i][layer_idx]
                 att_output = (
                     att_outputs[i] if i < len(att_outputs) else att_outputs[0]
                 )  # in case of self_attn
-                if hidden_states is not None:
-                    if layer is None:
+                if hidden_states is not None: # check if stream exists, otherwise append None
+                    if layer is None: # check if current model has a no corresponding layer,
+                        # its hidden states pass through unchanged. 
                         outputs_embeds.append(hidden_states)
                         continue
                     end = start + hidden_states.shape[1]
 
                     if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
                         att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-                    att_out = att_output[:, start:end]
-                    out_emb = layer.self_attn.o_proj(att_out)
+                    att_out = att_output[:, start:end] # select the portion belonging to the current stream
+                    out_emb = layer.self_attn.o_proj(att_out) # apply attention output projection
 
+                    # add first residual connectoin 
                     out_emb += hidden_states
                     after_first_residual = out_emb.clone()
 
+                    # apply layer normalization and MLP/ feed-forward sublayer 
                     out_emb = layer.post_attention_layernorm(out_emb)
                     out_emb = layer.mlp(out_emb)
 
+                    # add second residual connectoin 
                     out_emb += after_first_residual
 
                     outputs_embeds.append(out_emb)
@@ -540,7 +581,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 else:
                     outputs_embeds.append(None)
 
-            inputs_embeds = outputs_embeds
+            inputs_embeds = outputs_embeds # output of the current layer becomes the input to the next layer
 
         # final norm
         outputs_embeds = []

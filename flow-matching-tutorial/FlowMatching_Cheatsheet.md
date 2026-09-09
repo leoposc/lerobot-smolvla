@@ -91,3 +91,5 @@ A natural approach would be:
 Since this is computationally expensive, Flow Matching introduces a clever alternative: Don't simulate the ODE during training. Construct a known path between samples and directly train the network to reproduce its velocity field (Central idea of 2022 Flow Matching paper). 
 
 
+## 
+
