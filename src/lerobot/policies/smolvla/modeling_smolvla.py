@@ -629,7 +629,7 @@ class VLAFlowMatching(nn.Module):
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
 
     def _rtc_enabled(self):
-        return self.config.rtc_config is not None and self.config.rtc_config.enabled
+        return self.config.rtc_config is not None and self.config.rc_config.enabled
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
@@ -894,6 +894,19 @@ class VLAFlowMatching(nn.Module):
             execution_horizon=kwargs.get("execution_horizon"),
         )
 
+
+    """
+        @brief: This function is the core operation performed once per flow-matching denoising step.
+                Take the current noisy action chunk x_t, let the Action Expert predict its velocity 
+                v_t, and return the velocity to the Euler integration function.
+
+        @params:
+        - prefix_pad_masks: tells the model which VLM prefix tokens are valid and which are padding.
+        - past_key_values: the cahed VLM K/V representations created before the denoising loop. 
+        - x_t current noisy action chunk at timestep t.
+        - timestep: current t, e.g. 1.0, 0.9, ..., 0.0.
+
+    """
     def denoise_step(
         self,
         prefix_pad_masks,
@@ -901,8 +914,12 @@ class VLAFlowMatching(nn.Module):
         x_t,
         timestep,
     ):
-        """Apply one denoising step of the noise `x_t` at a given timestep."""
+
+        # convert the current action chunk x_t into embeddings suitable for the AE
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+
+        # Prefix = observations (image, language and robot state tokens)
+        # Suffix = current noisy action chunk x_t
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
