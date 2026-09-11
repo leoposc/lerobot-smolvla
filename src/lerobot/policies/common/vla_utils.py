@@ -62,10 +62,10 @@ def make_att_2d_masks(pad_masks: Tensor, att_masks: Tensor) -> Tensor:  # see op
     """Copied from big_vision.
 
     Tokens can attend to valid inputs tokens which have a cumulative mask_ar
-    smaller or equal to theirs. This way `mask_ar` int[B, N] can be used to
+    smaller or equal to theirs. This way `mask_ar` int[Batch_size, Num_tokens] can be used to
     setup several types of attention, for example:
 
-      [[1 1 1 1 1 1]]: pure causal attention.
+      [[1 1 1 1 1 1]]: pure causal attention. (= directional attention)
 
       [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
           themselves and the last 3 tokens have a causal attention. The first
@@ -74,8 +74,14 @@ def make_att_2d_masks(pad_masks: Tensor, att_masks: Tensor) -> Tensor:  # see op
       [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
           block can attend all previous blocks and all tokens on the same block.
 
+    In other words for the att_masks, the:
+    1: Start a new attention block. 
+    0: Continue the previous attention block. 
+        
+
     Args:
       input_mask: bool[B, N] true if its part of the input, false if padding.
+      This indicates whether a token actually exists. 
       mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
         it and 0 where it shares the same attention mask as the previous token.
     """
