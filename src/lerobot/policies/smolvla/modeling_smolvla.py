@@ -927,11 +927,7 @@ class VLAFlowMatching(nn.Module):
         # [B, prefix_len] -> [B, suffix_len, prefix_len]
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
 
-<<<<<<< HEAD
         # Ignore paddings and prevent that previous action tokens attend to future action tokens
-=======
-        # determine which action tokens can attend to which other action tokens
->>>>>>> a19435d (add comments.)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
         # combine prefix and suffix attention masks: [B, suffix_len, prefix_len] + [B, suffix_len, suffix_len]
