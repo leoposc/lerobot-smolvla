@@ -739,9 +739,9 @@ class VLAFlowMatching(nn.Module):
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
-        embs = []
-        pad_masks = []
-        att_masks = []
+        embs = [] # actual token embeddings [Batch_size, action_chunk_len, representation_dim]
+        pad_masks = [] # real suffix tokens vs padding 
+        att_masks = [] # attention structure between suffix tokens
 
         # Fuse timestep + action information using an MLP
         action_emb = self.action_in_proj(noisy_actions) # map actions dimension to expert hidden size
@@ -758,22 +758,24 @@ class VLAFlowMatching(nn.Module):
         )
         time_emb = time_emb.type(dtype=dtype)
 
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+        time_emb = time_emb[:, None, :].expand_as(action_emb) # create timestamp embedding for each action token in the chunk
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2) # concatenate action and timestamp information
 
+        # Fuse action + timestep with an MLP to create a single embedding for each action token in the chunk
         action_time_emb = self.action_time_mlp_in(action_time_emb)
-        action_time_emb = F.silu(action_time_emb)  # swish == silu
+        action_time_emb = F.silu(action_time_emb)  # swish == silu (sigmoid linear unit)
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
         # Add to input tokens
         embs.append(action_time_emb)
 
         bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device) # all action tokens are real tokens
         pad_masks.append(action_time_mask)
 
         # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] * self.config.chunk_size
+        att_masks += [1] * self.config.chunk_size # this tells make_att_2d_masks() that every action token 
+        # starts a new causal attention block 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
