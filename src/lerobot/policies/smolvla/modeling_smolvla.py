@@ -924,12 +924,20 @@ class VLAFlowMatching(nn.Module):
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
+        # [B, prefix_len] -> [B, suffix_len, prefix_len]
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
 
+<<<<<<< HEAD
         # Ignore paddings and prevent that previous action tokens attend to future action tokens
+=======
+        # determine which action tokens can attend to which other action tokens
+>>>>>>> a19435d (add comments.)
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
 
+        # combine prefix and suffix attention masks: [B, suffix_len, prefix_len] + [B, suffix_len, suffix_len]
+        # -> [B, suffix_len, prefix_len + suffix_len]
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        # determine the RoPE position of each aciton token
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
@@ -937,11 +945,12 @@ class VLAFlowMatching(nn.Module):
             attention_mask=full_att_2d_masks,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
+            inputs_embeds=[None, suffix_embs], # do not recompute VLM 
             use_cache=self.config.use_cache,
         )
         if past_key_values is not None:
-            # Self-attention layers append suffix K/V in place; restore the prefix for the next step.
+            # Self-attention layers append suffix K/V in place; restore the prefix for the next step
+            # by removing everything after the prefix length. 
             past_key_values.crop(prefix_len)
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]
