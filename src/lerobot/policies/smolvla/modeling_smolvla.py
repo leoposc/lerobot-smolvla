@@ -417,8 +417,17 @@ class SmolVLAPolicy(PreTrainedPolicy):
         """
         images = []
         img_masks = []
+        """
+        Conceptually: config.image_features = 
+        [
+            "observation.images.camera1",
+            "observation.images.camera2",
+            "observation.images.camera3"
+        ]            
+        """
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
+
 
         if len(present_img_keys) == 0:
             raise ValueError(
@@ -426,6 +435,9 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
         # Preprocess image features present in the batch
         for key in present_img_keys:
+            # extract image and handle 2 cases:
+            # case A: image has no temporal dimension -> [B, Channels, Height, Width]
+            # case B: image has temporal/ observation dimension -> select the last ovservation
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
             if self.config.resize_imgs_with_padding is not None:
                 # SmolVLA stores the target as (width, height); the shared helper expects (height, width).
@@ -433,7 +445,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                     img,
                     self.config.resize_imgs_with_padding[1],
                     self.config.resize_imgs_with_padding[0],
-                    pad_value=0,
+                    pad_value=0, # this padding is seen by SigLIP as black pixels, which is the expected behavior
                 )
 
             # Normalize from range [0,1] to [-1,1] as expacted by siglip
@@ -649,7 +661,7 @@ class VLAFlowMatching(nn.Module):
 
         Called by forward() and sample_actions()
         """
-        embs = []
+        embs = [] # [B, prefix_length, hidden_dim]
         pad_masks = []
         att_masks = []
         for _img_idx, (
@@ -661,13 +673,13 @@ class VLAFlowMatching(nn.Module):
                     self.vlm_with_expert.embed_language_tokens(
                         self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
                     )
-                    .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
+                    .unsqueeze(0) # add dimension of size 1 for batch
+                    .expand(img.shape[0], -1, -1) # make the batch dimension match the number of images in the batch
                 )
                 image_start_mask = torch.ones_like(
                     image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
                 )
-                att_masks += [0] * (image_start_mask.shape[-1])
+                att_masks += [0] * (image_start_mask.shape[-1]) # add 0s to the attention mask for the image start token
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
 
@@ -699,6 +711,8 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
+
+
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
