@@ -9,7 +9,7 @@ class Flow(nn.Module):
     def __init__(self, dim: int = 2, h: int = 64):
         print("Initiallizing Flow class")
         super().__init__()
-        # Interleaved Linear and Exponential Linear Unit layers
+        # I,nterleaved Linear and Exponential Linear Unit layers
         # ELU is described as 
         # x, if x > 0 
         # alpha(=1.0) * (exp(x) - 1), if x <= 0
