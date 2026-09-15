@@ -653,6 +653,38 @@ class VLAFlowMatching(nn.Module):
     def sample_time(self, bsize, device):
         return sample_time_beta(bsize, device, alpha=1.5, beta=1.0, scale=0.999, offset=0.001)
 
+    """
+                            embed_prefix()
+                            │
+            ┌───────────────┼────────────────┐
+            │               │                │
+            Images          Language          State
+            │               │                │
+            SigLIP       token embedding    state_proj
+            │               │                │
+            ↓               ↓                ↓
+        image tokens     language tokens    state token
+            │               │                │
+            └───────────────┴────────────────┘
+                            │
+                            ↓
+                    concatenate into
+                    PREFIX sequence
+                            │
+                            ↓
+                    [image | language | state]
+                            │
+                    ┌────────┴────────┐
+                    ↓                 ↓
+                pad_masks          att_masks
+                    │                 │
+                    └────────┬────────┘
+                            ↓
+                    pad to prefix_length
+                            │
+                            ↓
+                    return to sample_actions()
+    """
     def embed_prefix(
         self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -686,9 +718,9 @@ class VLAFlowMatching(nn.Module):
             img_emb = self.vlm_with_expert.embed_image(img)
             img_emb = img_emb
 
-            # Normalize image embeddings
+            # Normalize image embeddings (by putting the image embeddings on the appropriate magnitude relative to the other embeddigns)
             img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
+            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device) # explicitly create tensor
 
             bsize, num_img_embs = img_emb.shape[:2]
             img_mask = img_mask[:, None].expand(bsize, num_img_embs)
