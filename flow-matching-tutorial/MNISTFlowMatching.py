@@ -232,11 +232,11 @@ for epoch in range(50):
     )
 
 @torch.no_grad()
-def generate(model, digit, steps=10):
+def generate(model, digits, steps=10):
 
     model.eval() 
 
-    B = len(digit)
+    B = len(digits)
 
     x = torch.randn(
         B, 1, 28, 28,
@@ -246,7 +246,6 @@ def generate(model, digit, steps=10):
     dt = 1.0 / steps
 
     for i in range(steps):
-
         t = torch.full(
             (B,),
             i / steps,
@@ -256,7 +255,7 @@ def generate(model, digit, steps=10):
         velocity = model(
             x,
             t,
-            digit,
+            digits,
         )
 
         x += dt * velocity
