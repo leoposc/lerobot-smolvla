@@ -292,7 +292,7 @@ class SmolVLMWithExpertModel(nn.Module):
         query_states = apply_rope(query_states, position_ids_)
         key_states = apply_rope(key_states, position_ids_)
 
-        if use_cache:
+        if use_cache: # only evaluates to true during inference, when we want to store the K/V tensors for each layer in the cache.
             # `DynamicCache` stores tensors as [batch, heads, seq, head_dim]; this module works with
             # [batch, seq, heads, head_dim]. During prefix prefill this stores the (post-RoPE) K/V and
             # returns them unchanged; during denoising it appends the suffix K/V and returns
@@ -345,7 +345,9 @@ class SmolVLMWithExpertModel(nn.Module):
             f"Both len(inputs_embeds) == {len(inputs_embeds)} and past_key_values is {past_key_values}"
         )
 
-        if len(inputs_embeds) == 2 and not past_key_values:
+        if len(inputs_embeds) == 2 and not past_key_values: # only evaluates to true during training,
+            # when we have both prefix and action tokens. past_key_values is always None during training.  
+            
             # Prefix attention
             seq_len = inputs_embeds[0].shape[1]
             position_id, expert_position_id = position_ids[:, :seq_len], position_ids[:, seq_len:]
@@ -356,6 +358,7 @@ class SmolVLMWithExpertModel(nn.Module):
             hidden_states = layer.input_layernorm(inputs_embeds[0])
 
             input_shape = hidden_states.shape[:-1]
+            # compute the number of attention heads automatically based on the hidden size and head dimension
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
             hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
@@ -505,7 +508,7 @@ class SmolVLMWithExpertModel(nn.Module):
         # read from it instead.
         # During inference, fill_kv_cache is True
         fill_kv_cache = use_cache and past_key_values is None
-        if fill_kv_cache:
+        if fill_kv_cache: # during inference, the first time we run this function, we initialize the cache to store the K/V tensors for each layer.
             past_key_values = DynamicCache()
 
         # RMSNorm
@@ -515,7 +518,7 @@ class SmolVLMWithExpertModel(nn.Module):
         for layer_idx in range(num_layers):
             if (
                 fill_kv_cache
-                or "cross" not in self.attention_mode
+                or "cross" not in self.attention_mode # attention_mode is "cross_attn" -> evaluates to false every time
                 or (self.self_attn_every_n_layers > 0 and layer_idx % self.self_attn_every_n_layers == 0)
             ):
                 # perform self-attention
