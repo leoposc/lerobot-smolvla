@@ -7,6 +7,8 @@ from typing import override
 import matplotlib.pyplot as plt 
 from enum import Enum
 
+from pprint import pprint
+
 class Mode(Enum):
     CNN = 1
     BasicTransformer = 2
@@ -161,75 +163,70 @@ class FlowMatching_with_Transformer(nn.Module):
 # Training
 # ================================================================
 
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
-])
+def create_loader(training_size=1024, batch_size=128) -> DataLoader:
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
+    ])
 
-dataset = datasets.MNIST(
-    root="./data", 
-    train=True,
-    download=True,
-    transform=transform,
-)
-
-indices = torch.randperm(len(dataset))[:4096]
-dataset = Subset(dataset, indices)
-
-loader = DataLoader(
-    dataset,
-    batch_size=128,
-    shuffle=True,
-)
-
-
-match MODE:
-    case Mode.CNN:
-        model = FlowMatching().to(device)
-    case Mode.BasicTransformer:
-        model = FlowMatching_with_Transformer().to(device)
-
-optimizer = torch.optim.Adam(
-    model.parameters(),
-    lr=1e-3
-)
-
-
-for epoch in range(50):
-
-    total_loss = 0 
-
-    for x1, digit in loader:
-
-        x1 = x1.to(device)
-        digit = digit.to(device)
-
-        B = x1.shape[0]
-        x0 = torch.randn_like(x1) # gausssian source distribution
-
-        t = torch.rand(B, device=device)
-
-        t_img = t[:, None, None, None]
-        xt = ((1 - t_img) * x0 + t_img * x1)
-
-        target_velocity = x1 - x0
-        predicted_velocity = model(xt, t, digit)
-
-        loss = F.mse_loss(
-            predicted_velocity,
-            target_velocity,
-        )
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step() 
-
-        total_loss += loss.item() 
-
-    print(
-        f"Epoch {epoch + 1}: "
-        f"loss = {total_loss / len(loader):.4f}"
+    dataset = datasets.MNIST(
+        root="./data", 
+        train=True,
+        download=True,
+        transform=transform,
     )
+
+    indices = torch.randperm(len(dataset))[:training_size]
+    dataset = Subset(dataset, indices)
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+    )
+
+
+def train(model, loader, training_epochs=20):
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=1e-3
+    )
+
+    for epoch in range(training_epochs):
+
+        total_loss = 0 
+
+        for x1, digit in loader:
+
+            x1 = x1.to(device)
+            digit = digit.to(device)
+
+            B = x1.shape[0]
+            x0 = torch.randn_like(x1) # gausssian source distribution
+
+            t = torch.rand(B, device=device)
+
+            t_img = t[:, None, None, None]
+            xt = ((1 - t_img) * x0 + t_img * x1)
+
+            target_velocity = x1 - x0
+            predicted_velocity = model(xt, t, digit)
+
+            loss = F.mse_loss(
+                predicted_velocity,
+                target_velocity,
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step() 
+
+            total_loss += loss.item() 
+
+        print(
+            f"Epoch {epoch + 1}: "
+            f"loss = {total_loss / len(loader):.4f}"
+        )
 
 @torch.no_grad()
 def generate(model, digits, steps=10):
@@ -237,7 +234,6 @@ def generate(model, digits, steps=10):
     model.eval() 
 
     B = len(digits)
-
     x = torch.randn(
         B, 1, 28, 28,
         device=device,
@@ -262,23 +258,37 @@ def generate(model, digits, steps=10):
 
     return x 
 
-
-digits = torch.arange(10, device=device)
-
-samples = generate(
-    model, digits, steps=50
-)
-
-
-fig, axes = plt.subplots(1, 10, figsize=(15, 2))
-
-for i, ax in enumerate(axes):
-    ax.imshow(
-        samples[i, 0].cpu(),
-        cmap="gray",
+def show_all_digits(model):
+    digits = torch.arange(10, device=device)
+    samples = generate(
+        model, digits, steps=50
     )
 
-    ax.set_title(str(i))
-    ax.axis("off")
+    fig, axes = plt.subplots(1, 10, figsize=(15, 2))
 
-plt.show()
+    for i, ax in enumerate(axes):
+        ax.imshow(
+            samples[i, 0].cpu(),
+            cmap="gray",
+        )
+
+        ax.set_title(str(i))
+        ax.axis("off")
+    plt.show()
+
+def main():
+
+    match MODE:
+        case Mode.CNN:
+            model = FlowMatching().to(device)
+        case Mode.BasicTransformer:
+            model = FlowMatching_with_Transformer().to(device)
+            print(type(model.layers[0]))
+
+    loader = create_loader(training_size=10, batch_size=10)
+    train(model, loader)
+    show_all_digits(model)
+
+
+if __name__ == "__main__":
+    main()
