@@ -13,7 +13,10 @@ class Mode(Enum):
     CNN = 1
     BasicTransformer = 2
 
-MODE = Mode.CNN
+    def to_string(self):
+        return self.name
+
+MODE = Mode.BasicTransformer
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -276,6 +279,19 @@ def show_all_digits(model):
         ax.axis("off")
     plt.show()
 
+def save_model(model) -> None:
+    filename = f"{MODE.to_string()}.pt"
+    model.to("cpu")
+    model.eval()
+    torch.save(model.state_dict(), filename)
+
+def load_model(model):
+    filename = f"{MODE.to_string()}.pt"
+    model.load_state_dict(torch.load(filename, map_location=device))
+    return model
+
+
+
 def main():
 
     match MODE:
@@ -283,11 +299,16 @@ def main():
             model = FlowMatching().to(device)
         case Mode.BasicTransformer:
             model = FlowMatching_with_Transformer().to(device)
-            print(type(model.layers[0]))
+    
 
     loader = create_loader(training_size=10, batch_size=10)
     train(model, loader)
     show_all_digits(model)
+
+    save_model(model)
+
+    # model = load_model(model)
+    # show_all_digits(model)
 
 
 if __name__ == "__main__":
