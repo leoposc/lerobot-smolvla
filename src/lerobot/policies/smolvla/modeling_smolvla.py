@@ -178,11 +178,17 @@ def aloha_gripper_from_angular_inv(value):
  |    '---------------'            ▼                |       |
  |     |- forward()◄----------training              |       |
  |     |- sample_actions()◄---inference ◄-----------'       |
+ |     |                                                    |
  |     ▼                                                    |
- |     action chunk                                         |
- |     |                                                    |
- |     |                                                    |
- |     '--► robot execution                                 |
+ |    .----------------------.                              |
+ |    |SmolVLMWithExpertModel|                              |
+ |    '----------------------'                              |
+ |     |- embed_image()                                     |
+ |     |- embed_language_tokens()                           |
+ |     |- forward()                                         |
+ |     |- forward_attn_layer()                              |
+ |     |- forward_cross_attn_layer()                        |
+ |     '- eager_attention_forward()                         |
  |                                                          |
  '----------------------------------------------------------'
 
