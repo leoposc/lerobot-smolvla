@@ -315,21 +315,3 @@ def visualize_params(state_dict, initial_state_dict=None):
     )
     
     update()
-
-def show_all_digits(model, denoising_steps=50):
-    digits = torch.arange(10, device=device)
-    samples = generate(
-        model, digits, steps=denoising_steps
-    )
-
-    fig, axes = plt.subplots(1, 10, figsize=(15, 2))
-
-    for i, ax in enumerate(axes):
-        ax.imshow(
-            samples[i, 0].cpu(),
-            cmap="gray",
-        )
-
-        ax.set_title(str(i))
-        ax.axis("off")
-    plt.show()
