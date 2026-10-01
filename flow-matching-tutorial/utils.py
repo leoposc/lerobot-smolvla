@@ -13,18 +13,18 @@ def apply_rope(x, positions, max_wavelength=10_000):
         Returns:
         torch.Tensor: Tensor after applying RoPE, same shape as input x.
     """
-    d_half = x.shape[-1] // 2
+    *leading, seq_len, head_dim = x.shape
+    d_half = head_dim // 2
     device = x.device 
     dtype = x.dtype 
     x = x.to(torch.float32) # Ensure x is in float32 for precision during RoPE computation 
 
-    freq_exponents = (2.0 / x.shape[-1]) * torch.arange(d_half, device=device, dtype=dtype)
+    freq_exponents = (2.0 / head_dim) * torch.arange(d_half, device=device, dtype=dtype)
     timescale = max_wavelength ** freq_exponents
     radians = positions[..., None].to(torch.float32) / timescale[None, None, :].to(torch.float32)
-    radians = radians[..., None, :]
 
-    sin = torch.sin(radians) 
-    cos = torch.cos(radians)
+    sin = torch.sin(radians).unsqueeze(1)
+    cos = torch.cos(radians).unsqueeze(1)
 
     x1, x2 = x.split(d_half, dim=-1)
     res = torch.empty_like(x)
