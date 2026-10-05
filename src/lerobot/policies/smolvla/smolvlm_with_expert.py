@@ -635,6 +635,12 @@ class SmolVLMWithExpertModel(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
 
+        print("\n Shape of queries, key and values: ")
+        print(f"Query shape: {query_states.shape}")
+        print(f"Key shape:   {key_states.shape}")
+        print(f"Value shape: {value_states.shape}")
+
+
         # Every query token gets a score for every key token
         att_weights = torch.matmul(query_states, key_states.transpose(2, 3))
         att_weights *= head_dim**-0.5
@@ -651,5 +657,7 @@ class SmolVLMWithExpertModel(nn.Module):
         att_output = att_output.permute(0, 2, 1, 3)
         # we use -1 because sequence length can change
         att_output = att_output.reshape(batch_size, -1, num_key_value_heads * num_key_value_groups * head_dim)
+
+        print(f"Attn output shape: {att_output.shape}")
 
         return att_output

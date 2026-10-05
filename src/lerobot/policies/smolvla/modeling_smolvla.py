@@ -923,6 +923,7 @@ class VLAFlowMatching(nn.Module):
             for new observation timesteps t. 
 
         """
+        print("\nForwarding VLM with expert to compute past_key_values for prefix embeddings...\n")
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks, 
             position_ids=prefix_position_ids,
@@ -932,6 +933,7 @@ class VLAFlowMatching(nn.Module):
         )
         num_steps = self.config.num_steps
 
+        print("\nStarting Euler integration to generate action chunk...\n")
         return euler_integrate(
             lambda input_x_t, current_timestep: self.denoise_step(
                 x_t=input_x_t,
