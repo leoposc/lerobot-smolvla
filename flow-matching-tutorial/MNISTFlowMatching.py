@@ -235,7 +235,9 @@ def train(model, loader, training_epochs=20):
         )
 
 @torch.no_grad()
-def generate(model, digits, steps=10):
+def generate(model, digits, config):
+    steps = config["generation_steps"] if config is not None else 10
+    do_print = config["print_generation_process"] if config is not None else False
 
     model.eval() 
 
@@ -246,6 +248,9 @@ def generate(model, digits, steps=10):
     )
 
     dt = 1.0 / steps
+
+    if do_print:
+        _, axes = plt.subplots(steps, B, figsize=(B * 2, steps * 2))
 
     for i in range(steps):
         t = torch.full(
@@ -262,9 +267,23 @@ def generate(model, digits, steps=10):
 
         x += dt * velocity
 
+        if do_print:
+            for j in range(B):
+                axes[i, j].imshow(
+                    x[j, 0].cpu(),
+                    cmap="gray",
+                )
+                axes[i, j].axis("off")
+                if i == 0:
+                    axes[i, j].set_title(str(digits[j].item()))
+
+    if do_print:
+        plt.tight_layout()
+        plt.show()
+
     return x 
 
-def show_all_digits(model):
+def show_all_digits(model, config=None):
     digits = torch.arange(10, device=device)
     samples = generate(
         model, digits, steps=50
