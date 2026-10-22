@@ -1,4 +1,7 @@
 import torch
+import torch.nn as nn
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
@@ -32,3 +35,16 @@ def apply_rope(x, positions, max_wavelength=10_000):
     res[..., d_half:] = x1 * sin + x2 * cos
 
     return res.to(dtype)
+
+
+def save_model(model, config, name_suffix="") -> None:
+    filename = f"./trained_models/{config['mode'].to_string()}_{name_suffix}.pt"
+    model.to("cpu")
+    model.eval()
+    torch.save(model.state_dict(), filename)
+    model.to(device)
+
+def load_model(model, config, name_suffix="") -> nn.Module:
+    filename = f"./trained_models/{config['mode'].to_string()}_{name_suffix}.pt"
+    model.load_state_dict(torch.load(filename, map_location=device))
+    return model.to(device)
