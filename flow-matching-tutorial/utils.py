@@ -44,7 +44,7 @@ def save_model(model,name_suffix="") -> None:
     torch.save(model.state_dict(), filename)
     model.to(device)
 
-def load_model(model, config, name_suffix="") -> nn.Module:
-    filename = f"./trained_models/{config['mode'].to_string()}_{name_suffix}.pt"
+def load_model(model, name_suffix="") -> nn.Module:
+    filename = f"./trained_models/{name_suffix}.pt"
     model.load_state_dict(torch.load(filename, map_location=device))
     return model.to(device)
