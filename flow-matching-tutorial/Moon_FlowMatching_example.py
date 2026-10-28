@@ -4,8 +4,6 @@ from typing import override
 import matplotlib.pyplot as plt
 from sklearn.datasets import make_moons
 
-from Moons_util import plot_velocity_field, plot_trajectories
-
 
 class Flow(nn.Module):
     def __init__(self, dim: int = 2, h: int = 64):
@@ -37,20 +35,6 @@ class Flow(nn.Module):
         v_mid = self(x_mid, t_mid)
         return x_t + h * v_mid 
 
-
-    def step(self, x_t: Tensor, t_start: Tensor, t_end: Tensor) -> Tensor:
-        t_start = t_start.view(1, 1).expand(x_t.shape[0], 1)
-        dt = t_end - t_start # integration step size 
-        v_start = self(x_t=x_t, t_start) # initial velocity 
-        x_mid = x_t + v_start * dt / 2 # estimated state at midpoint 
-        x_end = self(x_t=x_mid, t_start + dt / 2)
-        return x_t + dt * x_end  # advance the state using the midpoint velocity 
-
-    def step(self, x_t: Tensor, t_start: Tensor, t_end: Tensor) -> Tensor:
-        t_start = t_start.view(1, 1).expand(x_t.shape[0], 1)
-        return x_t + (t_end - t_start) * self(t=t_start + (t_end - t_start) / 2, x_t= x_t + self(x_t=x_t, t=t_start) * (t_end - t_start) / 2)
-
-
     def euler_integration(self, x_t: Tensor, t_start, t_end: Tensor) -> Tensor:
         t = t_start.reshape(1, 1).expand(x_t.shape[0], 1)
         dt = t_end - t_start
@@ -61,7 +45,7 @@ class Flow(nn.Module):
         torch.save(self.state_dict(), path)
 
     def init_and_load_model(self, path: str) -> None:
-        # self.__init__()
+        self.__init__()
         self.load_state_dict(torch.load(path))
         self.eval()
 
@@ -87,7 +71,7 @@ def train():
     return flow
 
 flow = Flow()
-if not True: 
+if True: 
     flow = train()
 else: 
     flow.init_and_load_model("flow_model.pth")
@@ -113,5 +97,3 @@ plt.tight_layout()
 plt.show()
 
 
-plot_velocity_field(flow)
-plot_trajectories(flow)
