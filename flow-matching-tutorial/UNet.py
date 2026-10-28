@@ -240,6 +240,7 @@ class UNet(torch.nn.Module):
 class ConditionalUNet(nn.Module):
     def __init__(self, config, num_classes: int = 10):
         super().__init__()
+        self.config = config 
         D = config["embedding_dim"]
 
         self.conv1 = nn.Conv2d(1, D, 3, stride=1, padding=1)
@@ -291,16 +292,27 @@ class ConditionalUNet(nn.Module):
         x = F.relu(self.mid(x))          # (B, 2D, 7, 7)
 
         # Condition the bottleneck
-        mid_cond = self.time_mid(t_emb) + self.class_mid(c_emb)
-        x = x * (1 + mid_cond[:, :, None, None])
+        if self.config["apply_shift_scale_conditioning"] == True:
+            t_cond = self.time_mid(t_emb)[:, :, None, None]
+            c_cond = self.class_mid(c_emb)[:, :, None, None]
+            x = c_cond * x + t_cond
+        else:
+            mid_cond = self.time_mid(t_emb) + self.class_mid(c_emb)
+            x = x * (1 + mid_cond[:, :, None, None])
 
         # Decoder at 14 x 14
         x = self.up2(x)                  # (B, D, 14, 14)
         x = torch.cat([x, skip2], dim=1)
         x = F.relu(self.fuse2(x))        # (B, D, 14, 14)
 
-        dec_cond = self.time_dec(t_emb) + self.class_dec(c_emb)
-        x = x * (1 + dec_cond[:, :, None, None])
+        # condition the decoder 
+        if self.config["apply_shift_scale_conditioning"] == True:
+            t_cond = self.time_dec(t_emb)[:, :, None, None]
+            c_cond = self.class_dec(c_emb)[:, :, None, None]
+            x = c_cond * x + t_cond
+        else:
+            dec_cond = self.time_dec(t_emb) + self.class_dec(c_emb)
+            x = x * (1 + dec_cond[:, :, None, None])
 
         # Decoder at 28 x 28
         x = self.up1(x)                  # (B, D, 28, 28)
@@ -310,8 +322,86 @@ class ConditionalUNet(nn.Module):
         return self.out(x)               # (B, 1, 28, 28)
 
 
-
-
-
         
+class ConditionalUNetV2(nn.Module):
+    def __init__(self, config, num_classes: int = 10):
+        super().__init__()
+        self.config = config
+        D = config["embedding_dim"]
 
+        self.conv1 = nn.Conv2d(1, D, 3, padding=1)
+        self.down1 = nn.Conv2d(D, D, 2, stride=2)
+        self.down2 = nn.Conv2d(D, 2 * D, 2, stride=2)
+
+        self.flatten = nn.AdaptiveAvgPool2d((1, 1))
+        self.unflatten = nn.ConvTranspose2d(2 * D, 2 * D, kernel_size=7, stride=7)        
+        
+        self.up2 = nn.ConvTranspose2d(4 * D, D, 2, stride=2)
+        self.up1 = nn.ConvTranspose2d(2 * D, D, 2, stride=2)
+        self.conv_dec = nn.Conv2d(2 * D, D, 3, stride=1, padding=1)
+        self.out = nn.Conv2d(D, 1, 3, stride=1, padding=1)
+
+        # Embed sclar time into feature dimensions 
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, D),
+            nn.ReLU(),
+            nn.Linear(D, D)
+        )
+        self.time_mid = nn.Linear(D, 2 * D)
+        self.time_dec = nn.Linear(D, D)
+
+        # Embed class labels into feature dimensions
+        self.class_embed = nn.Embedding(num_classes, D)
+        self.class_mid = nn.Linear(D, 2 * D)
+        self.class_dec = nn.Linear(D, D)
+
+
+    def forward(self, x, t, c):
+        x = x.reshape(-1, 1, 28, 28)
+        B = x.shape[0]
+
+        # Make t shape (B, 1) and c shape (B,)
+        t = t.reshape(B, 1).to(dtype=x.dtype)
+        c = c.reshape(B).long() 
+
+        t_emb = self.time_embed(t)
+        c_emb = self.class_embed(c)
+
+        # Encoder
+        skip1 = F.relu(self.conv1(x))
+        skip2 = F.relu(self.down1(skip1))
+        skip3 = F.relu(self.down2(skip2))
+
+        x = self.flatten(skip3)
+        x = self.unflatten(x)
+        
+        # condition the bottleneck 
+        if self.config["apply_shift_scale_conditioning"] == True:
+            t_cond = self.time_mid(t_emb)[:, :, None, None]
+            c_cond = self.class_mid(c_emb)[:, :, None, None]
+            x = c_cond * x + t_cond
+        else:
+            mid_cond = self.time_mid(t_emb) + self.class_mid(c_emb)
+            x = x * (1 + mid_cond[:, :, None, None])
+
+        # concatenate skip connections
+        x = torch.cat([x, skip3], dim=1)
+        x = F.relu(self.up2(x))
+
+        # condition the second decoder layer 
+        if self.config["pply_shift_scale_conditioning"] == True:
+            t_cond = self.time_dec(t_emb)[:, :, None, None]
+            c_cond = self.class_dec(c_emb)[:, :, None, None]
+        else:
+            dec_cond = self.time_dec(t_emb) + self.class_dec(c_emb)
+            x = x * (1 + dec_cond[:, :, None, None])
+
+        # concatenate skip connections
+        x = torch.cat([x, skip2], dim=1)
+        x = F.relu(self.up1(x))
+
+        # concate skip connections
+        x = torch.cat([x, skip1], dim=1)
+        x = F.relu(self.conv_dec(x))
+        
+        return self.out(x)
