@@ -1,3 +1,4 @@
+from lerobot.policies.common.flow_matching import euler_integrate
 import torch 
 import numpy as np 
 from torch import nn, Tensor 
@@ -318,11 +319,26 @@ def train(model, loader, config):
     return total_loss_list
 
 
+def euler_integration(model, x_t, t, c, dt): 
+    velocity = model(x_t, t, c)
+    x_t += velocity * dt
+    return x_t
+
+
+def runge_kutta(model, x_t, t, c, dt):
+    v_start = model(x_t, t, c)
+    x_mid = x_t + 0.5 * dt * v_start
+    t_mid = t + 0.5 * dt
+    v_mid = model(x_t, t, c)
+    x_t += dt * v_mid
+    return x_t
+
+
 @torch.no_grad()
 def generate(model, digits, config):
     steps = config["denoising_steps"] if config is not None else 10
     do_print = config["print_generation_process"] if config is not None else False
-
+    
     print(f"Generating digits with {config['denoising_steps']} denoising steps...")
     model.eval() 
 
@@ -354,11 +370,16 @@ def generate(model, digits, config):
     for i in range(steps):
         t = torch.full(
             (B,),
+            i / steps,
             device=config["device"],
+            dtype=x.dtype
         )
 
-        velocity = model(x, t, digits)
-        x += dt * velocity
+        if config["apply_runge_kutta"] == True: 
+            x = runge_kutta(model, x, t, c, dt)
+        else:
+            x = euler_integration(model, x, t, c, dt)
+
 
         if do_print and i in plot_steps:
             for j in range(B):
