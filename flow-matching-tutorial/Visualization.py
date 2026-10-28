@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt 
 import torch
+import numpy as np 
 
 # from FlowMatching import generate
 
@@ -36,6 +37,35 @@ def plot_loss(loss_list):
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.show()
+
+
+def plot_losses(losses: np.ndarray, model_names: list[str]):
+    """
+    Plot training losses for multiple models.
+
+    Args:
+        losses: 2D array of shape (num_models, num_epochs).
+        model_names: Names of the models, one per row in losses.
+    """
+    losses = np.asarray(losses)
+
+    if losses.ndim != 2:
+        raise ValueError("losses must be a 2D array.")
+    if len(model_names) != losses.shape[0]:
+        raise ValueError("Number of model names must match the number of rows.")
+
+    for loss, name in zip(losses, model_names):
+        plt.plot(loss, label=name)
+
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Comparison")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
 
 def show_all_digits(model, generator_fn, config):
     digits = torch.arange(10, device=config["device"])
