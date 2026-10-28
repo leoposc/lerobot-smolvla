@@ -37,8 +37,8 @@ def apply_rope(x, positions, max_wavelength=10_000):
     return res.to(dtype)
 
 
-def save_model(model, config, name_suffix="") -> None:
-    filename = f"./trained_models/{config['mode'].to_string()}_{name_suffix}.pt"
+def save_model(model,name_suffix="") -> None:
+    filename = f"./trained_models/{name_suffix}.pt"
     model.to("cpu")
     model.eval()
     torch.save(model.state_dict(), filename)
