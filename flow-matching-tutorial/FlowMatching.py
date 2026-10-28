@@ -315,6 +315,8 @@ def train(model, loader, config):
     if config["plot_loss"]:
         plot_loss(total_loss_list)
 
+    return total_loss_list
+
 
 @torch.no_grad()
 def generate(model, digits, config):
@@ -333,7 +335,7 @@ def generate(model, digits, config):
     dt = 1.0 / steps
 
     if do_print:
-        num_plots = min(10, steps)
+        num_plots = min(5, steps)
         plot_steps = set(
             torch.linspace(0, steps - 1, num_plots)
             .round()
@@ -352,7 +354,6 @@ def generate(model, digits, config):
     for i in range(steps):
         t = torch.full(
             (B,),
-            i / steps,
             device=config["device"],
         )
 
