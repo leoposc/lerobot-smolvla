@@ -40,6 +40,13 @@ def sample_beta(alpha: float, beta: float, bsize: int, device) -> Tensor:  # see
     return dist.sample((bsize,)).to(device)
 
 
+def sample_time_beta(bsize: int, device, *, alpha: float, beta: float, scale: float, offset: float) -> Tensor:
+    """Beta-distributed flow-matching timesteps: ``Beta(alpha, beta) * scale + offset`` (openpi convention)."""
+    time_beta = sample_beta(alpha, beta, bsize, device)
+    time = time_beta * scale + offset
+    return time.to(dtype=torch.float32, device=device)
+
+
 def sample_noise(shape, device) -> Tensor:
     """Standard-normal float32 noise, the flow-matching x_1 sample."""
     return torch.normal(
@@ -49,13 +56,6 @@ def sample_noise(shape, device) -> Tensor:
         dtype=torch.float32,
         device=device,
     )
-
-
-def sample_time_beta(bsize: int, device, *, alpha: float, beta: float, scale: float, offset: float) -> Tensor:
-    """Beta-distributed flow-matching timesteps: ``Beta(alpha, beta) * scale + offset`` (openpi convention)."""
-    time_beta = sample_beta(alpha, beta, bsize, device)
-    time = time_beta * scale + offset
-    return time.to(dtype=torch.float32, device=device)
 
 
 def euler_integrate(
