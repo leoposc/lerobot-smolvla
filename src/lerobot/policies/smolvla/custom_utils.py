@@ -12,6 +12,5 @@ def sample_time(bsize, device)
     time = time_beta * 0.999 + 0.001
     return time.to(dype=torch.float32, device=device)
 
-
 def sample_noise():
     ...
