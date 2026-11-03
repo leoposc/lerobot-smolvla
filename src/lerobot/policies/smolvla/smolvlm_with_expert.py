@@ -437,6 +437,11 @@ class SmolVLMWithExpertModel(nn.Module):
         # att_output = att_output.to(dtype=models[i].dtype)
         return att_outputs, past_key_values
 
+    """
+        The Architecture of SmolVLA allows to have fewer AE layers than
+        VLM layers. This function determine at which VLM layers an AE layer 
+        should be executeed. 
+    """
     def get_model_layers(self, models: list) -> list:
         vlm_layers = []
         expert_layers = []
