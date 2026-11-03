@@ -52,3 +52,14 @@ def add_padding_to_tensor(tensor, max_len, pad_value=0):
     padded_tensor[:, :d] = tensor 
     return padded_tensor
 
+
+def make_att_2d_masks(pad_masks, att_masks):
+    if att_masks.ndim != 2:
+        raise ValueError(att_masks.ndim)
+    if pad_masks.ndim != 2:
+        raise ValueError(pad_masks.ndim)
+
+    cumsum = torch.cumsum(att_masks, dim=1)
+    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
+    return att_2d_masks & pad_2d_masks
