@@ -92,6 +92,10 @@ class FlowMatching_with_Transformer(nn.Module):
             stride=4,
         )
 
+        self.pos_embedding = nn.Parameter(            
+            torch.randn(1, 49, self.embedding_dim)
+        )
+
         if self.config["apply_rope"]:
 
            self.layers = nn.ModuleList([
@@ -105,9 +109,7 @@ class FlowMatching_with_Transformer(nn.Module):
            ])
 
         else:
-            self.pos_embedding = nn.Parameter(            
-                torch.randn(1, 49, self.embedding_dim)
-            )
+            
 
             self.layers = nn.ModuleList([
                 nn.TransformerEncoderLayer(
@@ -148,7 +150,7 @@ class FlowMatching_with_Transformer(nn.Module):
         patch = patch.transpose(1, 2)
 
         if self.config["apply_rope"]:
-            image_tokens = patch
+            image_tokens = patch + self.pos_embedding 
         else:
             image_tokens = patch + self.pos_embedding
 
@@ -210,24 +212,25 @@ def create_loader(config) -> DataLoader:
         transform=transform,
     )
 
-    targets = dataset.targets
-    samples_per_class = config["training_size"] // 10
+    if config["normalize_digit_distribution"] == True:
+        targets = dataset.targets
+        samples_per_class = config["training_size"] // 10
 
-    indices = []
+        indices = []
 
-    for i in range(10):
-        class_indices = torch.where(targets == i)[0]
+        for i in range(10):
+            class_indices = torch.where(targets == i)[0]
 
-        # Randomly sample an equal number from each class
-        perm = torch.randperm(len(class_indices))
-        selected = class_indices[perm[:samples_per_class]]
+            # Randomly sample an equal number from each class
+            perm = torch.randperm(len(class_indices))
+            selected = class_indices[perm[:samples_per_class]]
 
-        indices.append(selected)
+            indices.append(selected)
 
-    indices = torch.cat(indices)
-    indices = indices[torch.randperm(len(indices))]
+        indices = torch.cat(indices)
+        indices = indices[torch.randperm(len(indices))]
 
-    dataset = Subset(dataset, indices)
+        dataset = Subset(dataset, indices)
 
     return DataLoader(
         dataset,
@@ -376,9 +379,9 @@ def generate(model, digits, config):
         )
 
         if config["apply_runge_kutta"] == True: 
-            x = runge_kutta(model, x, t, c, dt)
+            x = runge_kutta(model, x, t, digits, dt)
         else:
-            x = euler_integration(model, x, t, c, dt)
+            x = euler_integration(model, x, t, digits, dt)
 
 
         if do_print and i in plot_steps:

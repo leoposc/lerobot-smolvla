@@ -35,12 +35,11 @@ class Attention(nn.Module):
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
         # Apply RoPE to q and k
-        position_ids = torch.arange(T-2, device=x.device).unsqueeze(0).expand(B, T-2)  # Exclude the first two tokens (digit and time embeddings)
-        q_content = apply_rope(q[:, :, 2:, :], position_ids)
-        k_content = apply_rope(k[:, :, 2:, :], position_ids)
-
-        q = torch.cat([q[:, :, :2, :], q_content], dim=2)
-        k = torch.cat([k[:, :, :2, :], k_content], dim=2) 
+        # position_ids = torch.arange(T-2, device=x.device).unsqueeze(0).expand(B, T-2)  # Exclude the first two tokens (digit and time embeddings)
+        # q_content = apply_rope(q[:, :, 2:, :], position_ids)
+        # k_content = apply_rope(k[:, :, 2:, :], position_ids)
+        # q = torch.cat([q[:, :, :2, :], q_content], dim=2)
+        # k = torch.cat([k[:, :, :2, :], k_content], dim=2) 
         
 
         attn = (
