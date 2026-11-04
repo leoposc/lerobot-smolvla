@@ -229,29 +229,41 @@ class FlowMatching(nn.Module):
         
 
     def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None):
+
+        models = [self.get_vlm_model().text_model, self.lm_expert]
+        model_layers = self.get_model_layers(models)
+        past_key_values = DynamicCache()
         bsize = state.shape[0]
         
         if noise is None:
             noise = sample_noise(bsize, self.config.noise)     
 
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state)
+        )
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1 
 
         # fill up the K/V cache of the VLM 
         for layer_idx in range(self.config.num_vlm_layers):
-            pass
+            layer = model_layers[0][layer_idx]
+            prefix_embs, past_key_values = self.self_attention(
+                model_layer=layer,
+                layer_idx=layer_idx,
+                input_embeds=prefix_embs,
+                position_ids=prefix_position_ids,
+                attention_mask=prefix_att_masks,
+                head_dim=self.config.text_config.head_dim,  
+                past_key_values=past_key_values
+            )
+            
+
+        return self.euler_integration(
+            noise,
+            past_key_values,
+
+        )
 
 
-        # interleave self and cross attention 
-        for layer_idx in range(self.config.num_ae_layers):
-            input_embeds = None
-
-            if layer_idx % 2 == 0:
-                self.self_attention()
-            else:
-                self.cross_attention()
-
-            output_embeds = None
-
-            input_embeds = output_embeds
 
 
     def attention(self, queries, values, keys):
@@ -274,8 +286,10 @@ class FlowMatching(nn.Module):
         return self.out_proj(out)
 
 
-    def self_attention(self):
-        ...
+    def self_attention(self, model_layer, layer_idx, input_embeds, position_ids, attention_mask, head_dim, past_key_values):
+        
+
+        
 
     def cross_attention(self):
         ...
@@ -283,6 +297,56 @@ class FlowMatching(nn.Module):
 
     def forward(self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None):
         ...
+        
+
+    def denoise_step(self, prefix_pad_masks, past_key_values, x_t, timestep):
+        
+        suffix_embs, suffix_pad_masks, suffix_masks = self.embed_suffix(x_t, timestep)
+        suffix_len =  suffix_pad_masks.shape[1]
+        bsize, prefix_len = prefix_pad_masks.shape[:2]
+        prefix_pad_2d_masks = prefix_pad_masks.expand(bsize, suffix_len, prefix_len)
+
+        suffix_att_2d_masks = make_att_2d_masks(suffis_pad_masks, suffix_att_masks)
+
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dime=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+        models = [self.get_vlm_model().text_model, self.lm_expert]
+        model_layers = self.get_model_layers(models)
+
+        for layer_idx in range(self.config.num_ae_layers):
+            
+            layer = model_layers[1][layer_idx]
+            if layer_idx % self.config.every_n_layer_self_attn == 0:
+                att_outputs, past_key_values = self.self_attention(
+                    model_layer=layer,
+                    layer_idx=layer_idx, 
+                    input_embeds=suffix_embs,
+                    head_dim=self.config.text_config.head_dim,
+                    past_key_values=past_key_values
+                )
+            else: 
+                att_outputs, past_key_values = self.cross_attention(
+                    model_layer=layer, 
+                    layer_idx=layer_idx,
+                    input_embeds=suffix_embs,
+                    head_dim=self.config.text_config.head_dim,
+                    past_key_values=past_key_values
+                )
+
+
+            out_emb = layer.self_attn.o_proj(att_outputs)
+            out_emb += suffix_embs 
+            after_first_residual = out_emb.clone()
+
+            out_emb = layer.post_attention_layernorm(out_emb)
+            out_emb = layer.mlp(out_emb)
+            out_emb += after_first_residual
+
+            suffix_embs = out_emb
+
+
 
 
     def euler_integration(self):
@@ -299,5 +363,7 @@ class FlowMatching(nn.Module):
             )
 
 
-            velocity = self.forward()
+            velocity = self.denoising_step(prefix_pad_masks, pas_key_values, x_t, timestep)
             x += velocity  * dt
+
+        return x
