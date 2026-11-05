@@ -41,10 +41,17 @@ def save_model(model,name_suffix="") -> None:
     filename = f"./trained_models/{name_suffix}.pt"
     model.to("cpu")
     model.eval()
-    torch.save(model.state_dict(), filename)
+    torch.save({
+        # "epoch": model.epoch, 
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": model.optimizer.state_dict(),
+        # "loss": loss, 
+        # "config": model.config
+    }, f"./trained_models/{name_suffix}.pt")
     model.to(device)
 
 def load_model(model, name_suffix="") -> nn.Module:
-    filename = f"./trained_models/{name_suffix}.pt"
-    model.load_state_dict(torch.load(filename, map_location=device))
+    checkpoint = torch.load(f"./trained_models/{name_suffix}.pt", weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return model.to(device)
