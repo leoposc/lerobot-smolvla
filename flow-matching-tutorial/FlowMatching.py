@@ -85,8 +85,20 @@ class FlowMatching_with_Transformer(nn.Module):
             nn.Linear(self.embedding_dim, self.embedding_dim),
         )
 
+        if self.config["apply_conv_stem"]:
+            self.conv_stem = nn.Sequential(
+                nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(32, self.embedding_dim, kernel_size=3, stride=1, padding=1),
+                nn.SiLU()
+            )
+            input_dim = self.embedding_dim
+        else:
+            input_dim = 1
+
+
         self.patch_embedding = nn.Conv2d(
-            in_channels=1,
+            in_channels=input_dim,
             out_channels=self.embedding_dim,
             kernel_size=4,
             stride=4,
@@ -144,6 +156,9 @@ class FlowMatching_with_Transformer(nn.Module):
         digit_emb = digit_emb.unsqueeze(1)
 
         time_emb = self.time_embedding(t.unsqueeze(1)).unsqueeze(1)
+
+        if self.config["apply_conv_stem"]:
+            x = self.conv_stem(x)
 
         patch = self.patch_embedding(x)
         patch = patch.flatten(2)
@@ -272,8 +287,9 @@ def optimal_transport_match(x0, x1, digit, config):
 def train(model, loader, config):
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=1e-3
+        lr=2e-3
     )
+    model.optimizer = optimizer
 
     total_loss_list = []
 
