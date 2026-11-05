@@ -44,7 +44,7 @@ def plot_losses(losses: np.ndarray, model_names: list[str]):
     Plot training losses for multiple models.
 
     Args:
-        losses: 2D array of shape (num_models, num_epochs).
+        losses: 2D array of shape (num_models, num_epochs). All values must be positive.
         model_names: Names of the models, one per row in losses.
     """
     losses = np.asarray(losses)
@@ -58,7 +58,8 @@ def plot_losses(losses: np.ndarray, model_names: list[str]):
         plt.plot(loss, label=name)
 
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.ylabel("Loss (log scale)")
+    plt.yscale("log")
     plt.title("Training Loss Comparison")
     plt.legend()
     plt.grid(True, alpha=0.3)
