@@ -66,9 +66,16 @@ Key points from §3:
 From §2 Method:
 
 **Multi-head Self-Attention (§2):**
-$$\text{MultiHead}(Q, K, V) = \text{Concat}(head_1, ..., head_h)W^O$$
-$$head_j = \text{Attention}(QW_j^Q, KW_j^K, VW_j^V), j \in [h]$$
-$$\text{Attention}(Q, K, V) = \text{Softmax}\frac{QK^T}{\sqrt{d_k}KV^T$$
+
+$$
+\text{MultiHead}(Q, K, V) = \text{Concat}(\text{head}_1, ..., \text{head}_h)W^O
+$$
+$$
+head_j = \text{Attention}(QW_j^Q, KW_j^K, VW_j^V), j \in [h]
+$$
+$$
+\text{Attention}(Q, K, V) = \text{Softmax} \frac{QK^T}{\sqrt{d_k}}KV^T
+$$
 
 
 Note: The authors use the Transformer's self-attention as-is from Vaswani et al., 2017 — no changes to attention mechanism itself, only application to vision patches.
