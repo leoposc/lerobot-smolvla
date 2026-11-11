@@ -48,7 +48,7 @@ The paper is also motivated by **computational efficiency**: Transformers can tr
 ```
 Input: image I → patch extraction (e.g., 224×224 → 16×16 patches) 
 → N^2 image patches per image → linear projection H_p × d_model 
-→ add learnable [class] token at start of sequence (length N^2 + 1) 
+→ **Conditioning based on token concatentation: ** add learnable [class] token at start of sequence (length $N^2$ + 1) 
 → transform encoder: L blocks × MHSA block + FFN block + residual+LN 
 → output y = CLS_token representation after final layer 
 → classifier head (optional, linear projection to C classes for classification)
@@ -66,11 +66,11 @@ Key points from §3:
 From §2 Method:
 
 **Multi-head Self-Attention (§2):**
-```
-MultiHead(Q, K, V) = Concat(head_1, ..., head_h)W^O
-head_j = Attention(QW_j^Q, KW_j^K,VW_j^V), j ∈ [h]
-Attention(Q, K, V) = Softmax((QK^T)/√d_k)(KV^T)  // Eqn. (1): attention formula
-```
+$$\text{MultiHead}(Q, K, V) = \text{Concat}(head_1, ..., head_h)W^O$$
+$$head_j = \text{Attention}(QW_j^Q, KW_j^K, VW_j^V), j \in [h]$$
+$$\text{Attention}(Q, K, V) = \text{Softmax}\frac{QK^T}{\sqrt{d_k}KV^T$$
+
+
 Note: The authors use the Transformer's self-attention as-is from Vaswani et al., 2017 — no changes to attention mechanism itself, only application to vision patches.
 
 **Image Representation (§3):**
