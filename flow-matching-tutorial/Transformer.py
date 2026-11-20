@@ -68,7 +68,9 @@ class Transformer(nn.Module):
 
         self.norm1 = nn.LayerNorm(embedding_dim, elementwise_affine=do_elementwise_affine)
         self.attn = Attention(
-            embedding_dim, n_heads
+            embedding_dim, n_heads,
+            # AdaLN passes digit/time as `condition`, not as tokens
+            num_prefix_tokens=0 if (config is not None and config["apply_AdaLN"] == True) else 2,
         )
         self.norm2 = nn.LayerNorm(embedding_dim, elementwise_affine=do_elementwise_affine)
         self.ff = nn.Sequential(
@@ -87,7 +89,7 @@ class Transformer(nn.Module):
 
 
     def forward(self, x, condition=None):
-        if self.config is not None and self.config["apply_AdaLN"] == True:
+        if self.config["apply_AdaLN"] == True:
 
             scale1, shift1 = self.adaLN1(condition).chunk(2, dim=-1)
             scale1 = scale1.unsqueeze(1)
