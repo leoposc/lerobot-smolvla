@@ -9,10 +9,10 @@ from utils import apply_rope
 # Custom Attention Layer with RoPE
 # ================================================================
 class Attention(nn.Module):
-    def __init__(self, embed_dim, n_heads):
+    def __init__(self, embed_dim, n_heads, num_prefix_tokens=2):
 
-        assert embed_dim & n_heads == 0, "embed_dim must be divisible by n_heads"
-        
+        assert embed_dim % n_heads == 0, "embed_dim must be divisible by n_heads"
+
         super().__init__()
         # Leading tokens that get no RoPE (digit + time tokens; 0 with AdaLN)
         self.num_prefix_tokens = num_prefix_tokens
