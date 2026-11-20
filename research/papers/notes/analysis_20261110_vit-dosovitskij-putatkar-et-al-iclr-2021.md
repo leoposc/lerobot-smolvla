@@ -48,7 +48,7 @@ The paper is also motivated by **computational efficiency**: Transformers can tr
 ```
 Input: image I → patch extraction (e.g., 224×224 → 16×16 patches) 
 → N^2 image patches per image → linear projection H_p × d_model 
-→ **Conditioning based on token concatentation: ** add learnable [class] token at start of sequence (length $N^2$ + 1) 
+→ **Conditioning:** add learnable [class] token at start of sequence (length $N^2$ + 1) 
 → transform encoder: L blocks × MHSA block + FFN block + residual+LN 
 → output y = CLS_token representation after final layer 
 → classifier head (optional, linear projection to C classes for classification)
