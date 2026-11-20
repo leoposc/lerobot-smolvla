@@ -71,9 +71,9 @@ class FlowMatching_with_Transformer(nn.Module):
 
         self.config = config
         super().__init__() 
-        self.num_layers = 8
+        self.num_layers = 6
         self.embedding_dim=64
-
+        self.pos_scaling= config["pos_scaling"]
         self.digit_embedding = nn.Embedding(
             num_embeddings=10,
             embedding_dim=self.embedding_dim
@@ -104,8 +104,8 @@ class FlowMatching_with_Transformer(nn.Module):
             stride=4,
         )
 
-        self.pos_embedding = nn.Parameter(            
-            torch.randn(1, 49, self.embedding_dim)
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, 49, self.embedding_dim) * self.pos_scaling
         )
 
         if self.config["apply_rope"]:
@@ -134,10 +134,24 @@ class FlowMatching_with_Transformer(nn.Module):
                 for _ in range(self.num_layers)
             ])
 
+        self.final_norm = nn.LayerNorm(self.embedding_dim)
+
         self.output_proj = nn.Sequential(
             nn.Linear(self.embedding_dim, self.embedding_dim),
             nn.SiLU(),
             nn.Linear(self.embedding_dim, 16),
+        )
+
+        # zero initialize the last layer to start by predicting a zero velocity. 
+        nn.init.zeros_(self.output_proj[-1].weight)
+        nn.init.zeros_(self.output_proj[-1].bias)
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(2, 32, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32, 1, 3, padding=1)
         )
 
 
@@ -151,27 +165,28 @@ class FlowMatching_with_Transformer(nn.Module):
 
     @override
     def forward(self, x, t, digit):
+        x_in = x
 
         digit_emb = self.digit_embedding(digit)
         digit_emb = digit_emb.unsqueeze(1)
 
         time_emb = self.time_embedding(t.unsqueeze(1)).unsqueeze(1)
 
-        if self.config["apply_conv_stem"]:
+        if self.config["apply_conv_stem"] == True:
             x = self.conv_stem(x)
 
         patch = self.patch_embedding(x)
         patch = patch.flatten(2)
         patch = patch.transpose(1, 2)
 
-        if self.config["apply_rope"]:
-            image_tokens = patch + self.pos_embedding 
+        if self.config["apply_rope"] == True:
+            image_tokens = patch
         else:
-            image_tokens = patch + self.pos_embedding
+            image_tokens = patch + self.pos_embedding 
 
 
-        if self.config["apply_AdaLN"]:
-            condition = digit_emb + time_emb
+        if self.config["apply_AdaLN"] == True:
+            condition = (digit_emb + time_emb).squeeze(1)  # [B, D]
             x = torch.cat([
                 image_tokens,
                 ], dim=1
@@ -192,12 +207,10 @@ class FlowMatching_with_Transformer(nn.Module):
             else:
                 x = layer(x)
 
-        if self.config is not None and not self.config["apply_AdaLN"]:
-            # remove digit and time tokens again 
-            image_tokens = x[:, 2:, :]
+        image_tokens = x if self.config["apply_AdaLN"] else x[:, 2:, :]
 
         # convert each token back into a 4x4 patch 
-        patches = self.output_proj(image_tokens)
+        patches = self.output_proj(self.final_norm(image_tokens))
         patches = patches.transpose(1, 2) # back to [B, 16, 49]
 
         # reconstruct the velocity image 
@@ -207,6 +220,8 @@ class FlowMatching_with_Transformer(nn.Module):
             kernel_size=4,
             stride=4,
         ) # [B, 1, 28, 28]
+
+        velocity = velocity + self.refine(torch.cat([velocity, x_in], dim=1))
 
         return velocity
 
@@ -287,7 +302,8 @@ def optimal_transport_match(x0, x1, digit, config):
 def train(model, loader, config):
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=2e-3
+        lr=config["learning_rate"],
+        betas=(0.9, 0.999)
     )
     model.optimizer = optimizer
 
@@ -313,8 +329,8 @@ def train(model, loader, config):
 
             t = torch.rand(B, device=config["device"]) 
 
-            t_img = t[:, None, None, None]
-            xt = ((1 - t_img) * x0 + t_img * x1)
+            t_expanded = t[:, None, None, None]
+            xt = ((1 - t_expanded) * x0 + t_expanded * x1)
 
             target_velocity = x1 - x0
             predicted_velocity = model(xt, t, digit)
@@ -335,6 +351,9 @@ def train(model, loader, config):
     if config["plot_loss"]:
         plot_loss(total_loss_list)
 
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
     return total_loss_list
 
 
@@ -348,7 +367,7 @@ def runge_kutta(model, x_t, t, c, dt):
     v_start = model(x_t, t, c)
     x_mid = x_t + 0.5 * dt * v_start
     t_mid = t + 0.5 * dt
-    v_mid = model(x_t, t, c)
+    v_mid = model(x_mid, t_mid, c)
     x_t += dt * v_mid
     return x_t
 
