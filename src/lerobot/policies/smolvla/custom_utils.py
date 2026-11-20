@@ -53,7 +53,7 @@ def add_padding_to_tensor(tensor, max_len, pad_value=0):
     return padded_tensor
 
 
-def make_att_2d_masks(pad_masks, att_masks):
+def create_attention_mask(pad_masks, att_masks):
     if att_masks.ndim != 2:
         raise ValueError(att_masks.ndim)
     if pad_masks.ndim != 2:
@@ -63,3 +63,14 @@ def make_att_2d_masks(pad_masks, att_masks):
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     return att_2d_masks & pad_2d_masks
+
+# Adapt the mask and position ids (if the current vlm layer does not have a matching expert layer)
+def adapt_mask_and_position_length(attn_mask, pos_ids, seq_len):
+    if seq_len < pos_ids.shape[1]:
+        _pos_ids = pos_ids[:, :seq_len]
+        _attn_mask = attn_mask[:, seq_len, :seq_len]
+    else:
+        _pos_ids = pos_ids 
+        _attn_mask = attn_mask 
+    return _attn_mask, _pos_ids
+

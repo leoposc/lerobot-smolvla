@@ -560,7 +560,7 @@ class SmolVLMWithExpertModel(nn.Module):
                 att_output = (
                     att_outputs[i] if i < len(att_outputs) else att_outputs[0]
                 )  # in case of self_attn
-                if hidden_states is not None: # check if stream exists, otherwise append None
+                if hidden_states is not None: # check if stream exists. Should only happen during inference.
                     if layer is None: # check if current model has a no corresponding layer,
                         # its hidden states pass through unchanged. 
                         outputs_embeds.append(hidden_states)
