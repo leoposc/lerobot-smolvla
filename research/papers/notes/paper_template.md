@@ -62,7 +62,7 @@ PDF: {{pdf_path}}
 $$[your latex equation]$$  
 *Interpretation: ...*  
 
-*(Include equations that clarify methodology or key results)*
+*(Include equations that clarify methodology or key results in latex format)*
 
 ---
 
