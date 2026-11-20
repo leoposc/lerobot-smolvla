@@ -14,6 +14,8 @@ class Attention(nn.Module):
         assert embed_dim & n_heads == 0, "embed_dim must be divisible by n_heads"
         
         super().__init__()
+        # Leading tokens that get no RoPE (digit + time tokens; 0 with AdaLN)
+        self.num_prefix_tokens = num_prefix_tokens
         self.embed_dim = embed_dim
         self.n_heads = n_heads
         self.head_dim = embed_dim // n_heads
