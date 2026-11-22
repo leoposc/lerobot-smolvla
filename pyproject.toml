@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "custom-smolvla"
+version = "0.1.0"
+description = "Custom SmolVLA policy, loaded into lerobot via --policy.discover_packages_path=CustomSmolVLA"
+requires-python = ">=3.12"
+# lerobot, torch and transformers are provided by the installed lerobot (editable) in the env.
+dependencies = []
+
+[tool.setuptools]
+packages = ["CustomSmolVLA"]
