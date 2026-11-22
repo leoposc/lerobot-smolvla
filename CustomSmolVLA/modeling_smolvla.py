@@ -6,7 +6,7 @@ from typing import Unpack
 
 
 import torch 
-from torch import nn
+from torch import nn, Tensor
 import torch.nn.functional as F
 from dataclasses import dataclass 
 
@@ -17,6 +17,7 @@ from typing import TypedDict, Unpack
 
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE 
 from lerobot.utils.import_utils import require_package 
+from lerobot.policies.common.vla_utils import resize_with_pad, pad_vector
 
 from lerobot.policies.pretrained import PreTrainedPolicy 
 
@@ -33,7 +34,15 @@ from transformers import (
     SmolVLMForConditionalGeneration,
 )
 
-from .custom_utils import * 
+from .custom_utils import (
+    sample_noise,
+    sample_time,
+    adapt_mask_and_position_length,
+    add_padding_to_tensor,
+    create_attention_mask,
+    create_sinusodial_pos_embedding
+)
+
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None 
@@ -94,7 +103,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
         self.init_rtc_processor()
-        self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
+        self.model = FlowMatching(config)
         self.reset()
 
     def reset(self):
@@ -418,7 +427,6 @@ class FlowMatching(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.expert = AutoModel.from_config(expert_config)
 
 
         self.vlm = AutoModelForImageTextToText.from_pretrained(
@@ -428,6 +436,7 @@ class FlowMatching(nn.Module):
         )
         self.vlm_config = self.vlm.config
         self.text_config = copy.deepcopy(self.vlm_config.text_config)
+        self.expert = AutoModel.from_config(self.text_config)
         self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
 
         self.action_in_proj = nn.Linear(config.max_action_dim, self.text_config.hidden_size)
@@ -438,13 +447,14 @@ class FlowMatching(nn.Module):
         # self.k_proj = nn.Linear(condig.ae_hidden_dim, self.text_config.hidden_size)
 
         self.state_proj = nn.Linear(
-            config.max_state_dim, self.text_config.hidden_shape
+            config.max_state_dim, self.text_config.hidden_size
         )
 
-        self.action_time_mlp = nn.Sequential(
-            nn.Linear(self.text_config.hidden_size * 2, self.text_config.hidden_size),
-            F.silu(),
-            nn.Linear(self.text_config.hidden_size, self.text_config.hidden_size)
+        self.action_time_mlp_in = nn.Linear(
+            self.text_config.hidden_size * 2, self.text_config.hidden_size
+        )
+        self.action_time_mlp_out = nn.Linear(
+            self.text_config.hidden_size, self.text_config.hidden_size
         )
 
 
@@ -468,7 +478,7 @@ class FlowMatching(nn.Module):
 
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        self.get_vlm_model().text_model.get_input_embeddings()(tokens)
+        return self.get_vlm_model().text_model.get_input_embeddings()(tokens)
 
 
     def embed_image(self, image):
@@ -485,8 +495,9 @@ class FlowMatching(nn.Module):
 
 
     def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, state = None):
-        embs = [] 
+        embs = []
         pad_masks = []
+        att_masks = []
 
         for _, (img, img_mask) in enumerate(zip(images, img_masks, strict=False)):
             # image_start_token = self.embed_language_tokens(tokens)
@@ -501,12 +512,11 @@ class FlowMatching(nn.Module):
             # pad_masks.append(image_start_mask)
 
             img_emb = self.embed_image(img)
-            print(img.shape)
-            bsize, num_img_embs, img_emb_dim = img_emb.shape[:2, -1]
+            bsize, num_img_embs, img_emb_dim = *img_emb.shape[:2], img_emb.shape[-1]
 
-            # Normalize image 
+            # Normalize image
             img_emb = img_emb * torch.tensor(img_emb_dim ** 0.5, dtype=img_emb.dtype, device=img_emb.device)
-            img_mask = img_mask.expand(bsize, num_img_embs)
+            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
 
             embs.append(img_emb)
             pad_masks.append(img_mask)
@@ -519,7 +529,7 @@ class FlowMatching(nn.Module):
 
         lang_emb = self.embed_language_tokens(lang_tokens)
         # normalize language embeddings 
-        num_lang_emb, lang_emb_dim = lang_emb.shape[1, -1]
+        num_lang_emb, lang_emb_dim = lang_emb.shape[1], lang_emb.shape[-1]
         lang_emb = lang_emb * (lang_emb_dim ** 0.5)
 
         embs.append(lang_emb)
@@ -528,23 +538,26 @@ class FlowMatching(nn.Module):
 
         # add state embeddings 
         state_emb = self.state_proj(state)
-        state_emb = state[:, None, :] if state_emb.ndim == 2 else state_emb
+        state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
         embs.append(state_emb)
 
+        bsize = state_emb.shape[0]
+        device = state_emb.device
         # states_seq_len = state_emb.shape[1]
         state_mask = torch.ones(1, 1, dtype=torch.bool, device=device).expand(bsize, 1)
         pad_masks.append(state_mask)
 
-        att_masks += 1
+        att_masks += [1]
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=embs.device)
+        att_masks = att_masks[None, :]
 
         seq_len = pad_masks.shape[1]
         if seq_len < self.config.prefix_length:
-            embs = add_padding_to_tensor(embs, self.prefix_length, 0)
-            pad_masks = add_padding_to_tensor(pad_masks, self.prefix_length, 0)
-            att_masks = add_padding_to_tensor(att_masks, self.prefix_length, 0)
+            embs = add_padding_to_tensor(embs, self.config.prefix_length, 0)
+            pad_masks = add_padding_to_tensor(pad_masks, self.config.prefix_length, 0)
+            att_masks = add_padding_to_tensor(att_masks, self.config.prefix_length, 0)
         att_masks = att_masks.expand(bsize, -1)
                                     
         return embs, pad_masks, att_masks
@@ -555,31 +568,34 @@ class FlowMatching(nn.Module):
         embs = []
         pad_masks = [] 
 
-        action_emb = self.action_in_proj(nosiy_actions)
+        action_emb = self.action_in_proj(noisy_actions)
         bsize = action_emb.shape[0]
-        dtype = action_emb.dtype 
+        dtype = action_emb.dtype
+        device = action_emb.device
 
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep, 
-            self.config.ae_hidden_dim, 
-            self.config.min_period, 
-            self.config.max_period, 
-            dtype=dtype,
+        time_emb = create_sinusodial_pos_embedding(
+            timestep,
+            self.text_config.hidden_size,
+            self.config.min_period,
+            self.config.max_period,
+            o_dtype=dtype,
             device=device
         )
         time_emb = time_emb[:, None, :].expand_as(action_emb)
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
-        action_time_emb = self.action_time_mlp(action_time_emb)
+        action_time_emb = self.action_time_mlp_in(action_time_emb)
+        action_time_emb = F.silu(action_time_emb)  # swish == silu (sigmoid linear unit)
+        action_time_emb = self.action_time_mlp_out(action_time_emb)
         action_time_dim = action_time_emb.shape[1]
         embs.append(action_time_emb)
 
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=self.config.device)
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
         pad_masks.append(action_time_mask)
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.ones(config.action_chunk_size, dtype=embs.dtype, device=config.device).expand(bsize, -1)
+        att_masks = torch.ones(self.config.chunk_size, dtype=embs.dtype, device=device).expand(bsize, -1)
         return embs, pad_masks, att_masks 
 
         
@@ -813,10 +829,10 @@ class FlowMatching(nn.Module):
 
 
         if noise is None:
-            noise = self.sample_noise(actions.shape, self.config.device)
+            noise = sample_noise(actions.shape, self.config.device)
 
         if time is None:
-            time = self.sample_time(action.shape[0], self.config.device)
+            time = sample_time(action.shape[0], self.config.device)
 
 
         # interpolation is inverted compared to standard flow matching, but mathematically 
