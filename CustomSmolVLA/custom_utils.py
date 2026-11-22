@@ -1,0 +1,77 @@
+import torch 
+from torch import Tensor
+import math 
+
+
+def sample_beta(bsize, device):
+    alpha_t = torch.tensor(1.5, dtype=torch.float32)
+    beta_t = torch.tensor(1, dtype=torch.float32)
+    dist = torch.distributions.Beta(alpha_t, beta_t)
+    return dist.sample((bsize,)).to(device)
+
+def sample_time(bsize, device):
+    time_beta = sample_beta(bsize, device)
+    time = time_beta * 0.999 + 0.001
+    return time.to(dype=torch.float32, device=device)
+
+
+def sample_noise(shape, device):
+    """Standard-normal float32 nosie, the flow-matching x_1 sample."""
+    return torch.normal(
+        mean=0.0,
+        std=1.0,
+        size=shape,
+        dtype=torch.float32,
+        device=device
+    )
+
+
+
+def create_sinusodial_pos_embedding(
+        time: torch.Tensor, dimension: int, min_period: float, max_period: float, o_dtype, device="cpu"
+) -> Tensor: 
+    if dimension % 2 != 0:
+        raise ValueError(f"dimension ({dimension}) must be divisible by 2")
+
+    if time.ndim != 1:
+        raise ValueError("The time tensor is expected to be of shape '(batch_size, )'.")
+
+    dtype = get_safe_dtype(torch.float64, device.type)
+    fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
+    period = min_period * (max_period / min_period) ** fraction 
+
+    scaling_factor = 1.0 / period * 2 * math.pi
+    sin_input = scaling_factor[None, :] * time[:, None]
+    return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1).to(dtype=o_dtype)
+
+
+def add_padding_to_tensor(tensor, max_len, pad_value=0):
+    bsize, d = tensor.shape[:2]
+    padded_tensor = torch.full(
+        (bsize, max_len, *tensor.shape[2:]), pad_value, dtype=tensor.dtype, device=tensor.device
+    )
+    padded_tensor[:, :d] = tensor 
+    return padded_tensor
+
+
+def create_attention_mask(pad_masks, att_masks):
+    if att_masks.ndim != 2:
+        raise ValueError(att_masks.ndim)
+    if pad_masks.ndim != 2:
+        raise ValueError(pad_masks.ndim)
+
+    cumsum = torch.cumsum(att_masks, dim=1)
+    att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
+    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
+    return att_2d_masks & pad_2d_masks
+
+# Adapt the mask and position ids (if the current vlm layer does not have a matching expert layer)
+def adapt_mask_and_position_length(attn_mask, pos_ids, seq_len):
+    if seq_len < pos_ids.shape[1]:
+        _pos_ids = pos_ids[:, :seq_len]
+        _attn_mask = attn_mask[:, seq_len, :seq_len]
+    else:
+        _pos_ids = pos_ids 
+        _attn_mask = attn_mask 
+    return _attn_mask, _pos_ids
+
