@@ -1,201 +1,71 @@
 #!/usr/bin/env python
 
-# Copyright 2025 HuggingFace Inc. team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-"""
-SmolVLA:
+from dataclasses import dataclass
+from turtle import position
+from typing import Unpack
 
-[Paper](https://huggingface.co/papers/2506.01844)
+from numpy import dtype, transpose
 
-Designed by Hugging Face.
+import torch 
+from torch import nn
+import torch.nn.functional as F
+from dataclasses import dataclass 
 
-Install smolvla extra dependencies:
-```bash
-pip install -e ".[smolvla]"
-```
+import math 
+from collections import deque 
+from typing import TypedDict, Unpack 
 
-Example of finetuning the smolvla pretrained model (`smolvla_base`):
-```bash
-lerobot-train \
---policy.path=lerobot/smolvla_base \
---dataset.repo_id=<USER>/svla_so100_task1_v3 \
---batch_size=64 \
---steps=200000
-```
+from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE 
+from lerobot.utils.import_utils import require_package 
 
-Example of finetuning a smolVLA. SmolVLA is composed of a pretrained VLM,
-and an action expert.
-```bash
-lerobot-train \
---policy.type=smolvla \
---dataset.repo_id=<USER>/svla_so100_task1_v3 \
---batch_size=64 \
---steps=200000
-```
+from ..pretrained import PreTrainedPolicy 
 
-Example of using the smolvla pretrained model outside LeRobot training framework:
-```python
-policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
-```
+from .configuration_smolvla import SmolVLAConfig 
 
-"""
 
-import math
-from collections import deque
-from typing import TypedDict, Unpack
 
-import torch
-import torch.nn.functional as F  # noqa: N812
-from torch import Tensor, nn
-
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
-from lerobot.utils.import_utils import require_package
-
-from ..common.flow_matching import euler_integrate, sample_noise, sample_time_beta
-from ..common.vla_utils import (
-    create_sinusoidal_pos_embedding,
-    make_att_2d_masks,
-    pad_vector,
-    resize_with_pad,
+from transformers import (
+    AutoConfig, 
+    AutoModel, 
+    AutoModelForImageTextToText, 
+    AutoProcessor, 
+    DynamicCache, 
+    SmolVLMForConditionalGeneration,
 )
-from ..pretrained import PreTrainedPolicy
-from ..rtc.modeling_rtc import RTCProcessor
-from ..utils import (
-    populate_queues,
-)
-from .configuration_smolvla import SmolVLAConfig
-from .smolvlm_with_expert import SmolVLMWithExpertModel
 
+from .custom_utils import * 
 
 class ActionSelectKwargs(TypedDict, total=False):
-    inference_delay: int | None
-    prev_chunk_left_over: Tensor | None
+    inference_delay: int | None 
+    prev_chunk_left_over: int | None 
     execution_horizon: int | None
 
-
-def normalize(x, min_val, max_val):
-    return (x - min_val) / (max_val - min_val)
-
-
-def unnormalize(x, min_val, max_val):
-    return x * (max_val - min_val) + min_val
-
-
-def safe_arcsin(value):
-    # This ensures that the input stays within
-    # [−1,1] to avoid invalid values for arcsin
-    return torch.arcsin(torch.clamp(value, -1.0, 1.0))
-
-
-
-
-"""
-    ALOHA is a robot system, that uses four robot arms from Trossen Robotics. With ALOHA
-    a new algorithm called ACT was introduced. ACT is a compact model with roughly 80M
-    parameters. The 3 main components are:
-
-    - ResNet image encoder 
-    - Transformer encoder 
-    - Transformer decoder
-"""
-def aloha_gripper_to_angular(value):
-    # Aloha transforms the gripper positions into a linear space. The following code
-    # reverses this transformation to be consistent with smolvla which is pretrained in
-    # angular space.
-    #
-    # These values are coming from the Aloha code:
-    # PUPPET_GRIPPER_POSITION_OPEN, PUPPET_GRIPPER_POSITION_CLOSED
-    value = unnormalize(value, min_val=0.01844, max_val=0.05800)
-
-    # This is the inverse of the angular to linear transformation inside the Interbotix code.
-    def linear_to_radian(linear_position, arm_length, horn_radius):
-        value = (horn_radius**2 + linear_position**2 - arm_length**2) / (2 * horn_radius * linear_position)
-        return safe_arcsin(value)
-
-    # The constants are taken from the Interbotix code.
-    value = linear_to_radian(value, arm_length=0.036, horn_radius=0.022)
-
-    # Normalize to [0, 1].
-    # The values 0.4 and 1.5 were measured on an actual Trossen robot.
-    return normalize(value, min_val=0.4, max_val=1.5)
+# @dataclass 
+# class SmolVLAConfig():
+#
+#     # VLM configuration 
+#     vlm_model_name = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+#     load_vlm_weights = True
+#     num_vlm_layers = 16
+#     vlm_dim = 64
+#
+#
+#     state_dim= 32 
+#     resize_img_to = (512, 512)
+#
+#     # Action expert configuration 
+#     ae_dim = int(vlm_dim * 0.75)
+#     num_ae_layers = 16
+#     denoising_steps = 10
+#     action_dim = 32 
+#     action_chunk_size = 50
+#
+#     device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def aloha_gripper_from_angular(value):
-    # Convert from the gripper position used by smolvla to the gripper position that is used by Aloha.
-    # Note that the units are still angular but the range is differentmode smol.
-
-    # The values 0.4 and 1.5 were measured on an actual Trossen robot.
-    value = unnormalize(value, min_val=0.4, max_val=1.5)
-
-    # These values are coming from the Aloha code:
-    # PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_JOINT_CLOSE
-    return normalize(value, min_val=-0.6213, max_val=1.4910)
 
 
-def aloha_gripper_from_angular_inv(value):
-    # Directly inverts the gripper_from_angular function.
-    value = unnormalize(value, min_val=-0.6213, max_val=1.4910)
-    return normalize(value, min_val=0.4, max_val=1.5)
-
-
-"""
- .----------------------------------------------------------.
- |  Lerobot environment/ dataset                            |
- |                |                                         |
- |                |                                         |
- |                |      .------------------.               |
- |                ▼      |images, state,    |               |
- |             Batch:    |language tokens,  |               |
- |                |      |actions (training)|               |
- |                |      '------------------'               |
- |                |                                         |
- |                ▼                                         |
- |    .-------------.
- |    |SmolVLAPolicy|                                       |
- |    '-------------'                                       |
- |  .-►|- prepare_images() ◄---------------------------.    |
- |  |-►|- prepare_state()  ◄---------------------------|    |
- |  |-►|- prepare_action()                             |    |
- |  |  |                                               |    |
- |  |  |- predict_action_chunk()/ select_action()---.  |    |
- |  '--|- forward()----------------.                |  |    |
- |     |                           |                |  |    |
- |     ▼                           |    get_action_chunk()  |
- |    .---------------.            |                |       |
- |    |VLAFlowMatching|            |                |       |
- |    '---------------'            ▼                |       |
- |     |- forward()◄----------training              |       |
- |     |- sample_actions()◄---inference ◄-----------'       |
- |     |                                                    |
- |     ▼                                                    |
- |    .----------------------.                              |
- |    |SmolVLMWithExpertModel|                              |
- |    '----------------------'                              |
- |     |- embed_image()                                     |
- |     |- embed_language_tokens()                           |
- |     |- forward()                                         |
- |     |- forward_attn_layer()                              |
- |     |- forward_cross_attn_layer()                        |
- |     '- eager_attention_forward()                         |
- |                                                          |
- '----------------------------------------------------------'
-
- This class serves as interface expected by LeRobot. The actual neural network 
- is inside VLAFlowMatching. 
-
- """
 class SmolVLAPolicy(PreTrainedPolicy):
     """Wrapper class around VLAFlowMatching model to train and run inference within LeRobot."""
 
@@ -541,471 +411,568 @@ class SmolVLAPolicy(PreTrainedPolicy):
             logging.warning(
                 "Training SmolVLA from scratch using PEFT. This is unlikely to yield good results. "
                 "Set `load_vlm_weights=True` to fine-tune the existing policy."
-            )
+            ) 
 
 
-def pad_tensor(tensor, max_len, pad_value=0):
-    """
-    Efficiently pads a tensor along sequence dimension to match max_len.
 
-    Args:
-        tensor (torch.Tensor): Shape (B, L, ...) or (B, L).
-        max_len (int): Fixed sequence length.
-        pad_value (int/float): Value for padding.
-
-    Returns:
-        torch.Tensor: Shape (B, max_len, ...) or (B, max_len).
-    """
-    b, d = tensor.shape[:2]
-
-    # Create a padded tensor of max_len and copy the existing values
-    padded_tensor = torch.full(
-        (b, max_len, *tensor.shape[2:]), pad_value, dtype=tensor.dtype, device=tensor.device
-    )
-    padded_tensor[:, :d] = tensor  # Efficient in-place copy
-
-    return padded_tensor
-
-
-class VLAFlowMatching(nn.Module):
-    """
-    SmolVLA 
-
-    [Paper]()
-
-    Designed by Hugging Face.
-    ┌──────────────────────────────┐
-    │                 actions      │
-    │                    ▲         │
-    │ ┌─────────┐      ┌─|────┐    │
-    │ |         │────► │      │    │
-    │ |         │ kv   │      │    │
-    │ |         │────► │Action│    │
-    │ |   VLM   │cache │Expert│    |
-    │ │         │────► |      │    │
-    │ │         │      │      │    │
-    │ └▲──▲───▲─┘      └───▲──┘    |
-    │  │  |   |            │       |
-    │  |  |   |          noise     │
-    │  │  │ state                  │
-    │  │ language tokens           │
-    │  image(s)                    │
-    └──────────────────────────────┘
-    """
-
-    """
-        The __init__() builds the action-expert part and small projection layers 
-        that connect it to the rest of the model. 
-        - Stores 
-
-    """
-    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
+class FlowMatching(nn.Module):
+    def __init__(self, config):
         super().__init__()
         self.config = config
+        self.expert = AutoModel.from_config(expert_config)
 
-        self.vlm_with_expert = SmolVLMWithExpertModel(
-            model_id=self.config.vlm_model_name,
-            freeze_vision_encoder=self.config.freeze_vision_encoder,
-            train_expert_only=self.config.train_expert_only,
-            load_vlm_weights=self.config.load_vlm_weights,
-            attention_mode=self.config.attention_mode,
-            num_expert_layers=self.config.num_expert_layers,
-            num_vlm_layers=self.config.num_vlm_layers,
-            self_attn_every_n_layers=self.config.self_attn_every_n_layers,
-            expert_width_multiplier=self.config.expert_width_multiplier,
-            device=self.config.device if self.config.device is not None else "auto",
+
+        self.vlm = AutoModelForImageTextToText.from_pretrained(
+            "HuggingFaceTB/SmolVLM2-500M-Video-Instruct", 
+            torch_dtype="bfloat16",
+            low_cpu_mem_usage=True
         )
+        self.vlm_config = self.vlm.config
+        self.text_config = copy.deepcopy(self.vlm_config.text_config)
+        self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
+
+        self.action_in_proj = nn.Linear(config.max_action_dim, self.text_config.hidden_size)
+        self.action_out_proj = nn.Linear(self.text_config.hidden_size, config.max_action_dim)
+
+        # self.q_proj = nn.Linear(self.text_config.ae_hidden_dim, self.text_config.ae_hidden_dim)
+        # self.v_proj = nn.Linear(condig.ae_hidden_dim, self.text_config.hidden_size)
+        # self.k_proj = nn.Linear(condig.ae_hidden_dim, self.text_config.hidden_size)
+
         self.state_proj = nn.Linear(
-            self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
-        )
-        self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
-        self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
-
-        self.action_time_mlp_in = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
-        )
-        self.action_time_mlp_out = nn.Linear(
-            self.vlm_with_expert.expert_hidden_size, self.vlm_with_expert.expert_hidden_size
+            config.max_state_dim, self.text_config.hidden_shape
         )
 
-        self.set_requires_grad()
-        self.fake_image_token = self.vlm_with_expert.processor.tokenizer.fake_image_token_id
-        self.global_image_token = self.vlm_with_expert.processor.tokenizer.global_image_token_id
-        self.global_image_start_token = torch.tensor(
-            [self.fake_image_token, self.global_image_token], dtype=torch.long
+        self.action_time_mlp = nn.Sequential(
+            nn.Linear(self.text_config.hidden_size * 2, self.text_config.hidden_size),
+            F.silu(),
+            nn.Linear(self.text_config.hidden_size, self.text_config.hidden_size)
         )
 
-        self.add_image_special_tokens = self.config.add_image_special_tokens
-        self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
-        self.prefix_length = self.config.prefix_length
-        self.rtc_processor = rtc_processor
 
-        # Compile model if requested
-        if config.compile_model:
-            torch.set_float32_matmul_precision("high")
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
-            self.forward = torch.compile(self.forward, mode=config.compile_mode)
+    def get_vlm_model(self):
+        return self.vlm.model
 
-    def _rtc_enabled(self):
-        return self.config.rtc_config is not None and self.config.rc_config.enabled
+    def get_model_layers(self, models):
+            vlm_layers = []
+            expert_layers = []
+            multiple_of = self.num_vlm_layers // self.num_expert_layers 
+            for i in range(self.num_vlm_layers):
+                if multiple_of > 0 and i > 0 and i % multiple_of != 0:
+                    expert_layer = None 
+                else: 
+                    expert_layer_index = i // multiple_of if multiple_of > 0 else i 
+                    expert_layer = models[1].layers[expert_layer_index]
+                vlm_layers.append(models[0].layers[i])
+                expert_layers.append(expert_layer)
+            return [vlm_layers, expert_layers]
+                
 
-    def set_requires_grad(self):
-        for params in self.state_proj.parameters():
-            params.requires_grad = self.config.train_state_proj
 
-    def sample_noise(self, shape, device):
-        return sample_noise(shape, device)
+    def embed_language_tokens(self, tokens: torch.Tensor):
+        self.get_vlm_model().text_model.get_input_embeddings()(tokens)
 
-    def sample_time(self, bsize, device):
-        return sample_time_beta(bsize, device, alpha=1.5, beta=1.0, scale=0.999, offset=0.001)
 
-    """
-                            embed_prefix()
-                            │
-            ┌───────────────┼────────────────┐
-            │               │                │
-            Images          Language          State
-            │               │                │
-            SigLIP       token embedding    state_proj
-            │               │                │
-            ↓               ↓                ↓
-        image tokens     language tokens    state token
-            │               │                │
-            └───────────────┴────────────────┘
-                            │
-                            ↓
-                    concatenate into
-                    PREFIX sequence
-                            │
-                            ↓
-                    [image | language | state]
-                            │
-                    ┌────────┴────────┐
-                    ↓                 ↓
-                pad_masks          att_masks
-                    │                 │
-                    └────────┬────────┘
-                            ↓
-                    pad to prefix_length
-                            │
-                            ↓
-                    return to sample_actions()
-    """
-    def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Embed images with SigLIP and language tokens with embedding layer to prepare
-        for SmolVLM transformer processing.
+    def embed_image(self, image):
+        patch_attention_mask = None
+        image_hidden_states = (
+            self.get_vlm_model()
+            .vision_model(
+                pixel_values=image.to(dtype=self.get_vlm_model().vision_model.dtype),
+                patch_attention_mask=None,
+            )
+            .last_hidden_state
+        )
+        return self.get_vlm_model().connector(image_hidden_states)
 
-        Called by forward() and sample_actions()
-        """
-        embs = [] # [B, prefix_length, hidden_dim]
+
+    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, state = None):
+        embs = [] 
         pad_masks = []
-        att_masks = []
-        for _img_idx, (
-            img,
-            img_mask,
-        ) in enumerate(zip(images, img_masks, strict=False)):
-            if self.add_image_special_tokens:
-                image_start_token = (
-                    self.vlm_with_expert.embed_language_tokens(
-                        self.global_image_start_token.to(device=self.vlm_with_expert.vlm.device)
-                    )
-                    .unsqueeze(0) # add dimension of size 1 for batch
-                    .expand(img.shape[0], -1, -1) # make the batch dimension match the number of images in the batch
-                )
-                image_start_mask = torch.ones_like(
-                    image_start_token[:, :, 0], dtype=torch.bool, device=image_start_token.device
-                )
-                att_masks += [0] * (image_start_mask.shape[-1]) # add 0s to the attention mask for the image start token
-                embs.append(image_start_token)
-                pad_masks.append(image_start_mask)
 
-            img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
+        for _, (img, img_mask) in enumerate(zip(images, img_masks, strict=False)):
+            # image_start_token = self.embed_language_tokens(tokens)
+            #     .unsequeeze(0)
+            #     .expand(img.shape[0], -1, -1)
+            #
+            # image_start_mask = torch.ones_like(
+            #     image_start_token[:, :, 0], dtype=torch.bool, device=self.config.device
+            # )
+            # att_masks = [0] * image_stark_mask.shape[-1]
+            # embs.append(image_start_token)
+            # pad_masks.append(image_start_mask)
 
-            # Normalize image embeddings (by putting the image embeddings on the appropriate magnitude relative to the other embeddigns)
-            img_emb_dim = img_emb.shape[-1]
-            img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device) # explicitly create tensor
+            img_emb = self.embed_image(img)
+            print(img.shape)
+            bsize, num_img_embs, img_emb_dim = img_emb.shape[:2, -1]
 
-            bsize, num_img_embs = img_emb.shape[:2]
-            img_mask = img_mask[:, None].expand(bsize, num_img_embs)
+            # Normalize image 
+            img_emb = img_emb * torch.tensor(img_emb_dim ** 0.5, dtype=img_emb.dtype, device=img_emb.device)
+            img_mask = img_mask.expand(bsize, num_img_embs)
 
             embs.append(img_emb)
             pad_masks.append(img_mask)
 
-            att_masks += [0] * (num_img_embs)
-            if self.add_image_special_tokens:
-                image_end_token = (
-                    self.vlm_with_expert.embed_language_tokens(
-                        self.image_end_token.to(device=self.vlm_with_expert.vlm.device)
-                    )
-                    .unsqueeze(0)
-                    .expand(img.shape[0], -1, -1)
-                )
-                image_end_mask = torch.ones_like(
-                    image_end_token[:, :, 0], dtype=torch.bool, device=image_end_token.device
-                )
-                embs.append(image_end_token)
-                pad_masks.append(image_end_mask)
-                att_masks += [0] * (image_end_mask.shape[1])
+            att_masks += [0] * num_img_embs
 
+            # add image special tokens?
+            
+            # done with image embeddings 
 
-        lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-        # Normalize language embeddings
-        lang_emb_dim = lang_emb.shape[-1]
-        lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        lang_emb = self.embed_language_tokens(lang_tokens)
+        # normalize language embeddings 
+        num_lang_emb, lang_emb_dim = lang_emb.shape[1, -1]
+        lang_emb = lang_emb * (lang_emb_dim ** 0.5)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
+        att_masks += [0] * num_lang_emb
 
-        num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
-
+        # add state embeddings 
         state_emb = self.state_proj(state)
-        state_emb = state_emb[:, None, :] if state_emb.ndim == 2 else state_emb
+        state_emb = state[:, None, :] if state_emb.ndim == 2 else state_emb
         embs.append(state_emb)
-        bsize = state_emb.shape[0]
-        device = state_emb.device
 
-        states_seq_len = state_emb.shape[1]
-        state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
+        # states_seq_len = state_emb.shape[1]
+        state_mask = torch.ones(1, 1, dtype=torch.bool, device=device).expand(bsize, 1)
         pad_masks.append(state_mask)
 
-        # Set attention masks so that image and language inputs do not attend to state or actions
-        att_masks += [1] * (states_seq_len)
+        att_masks += 1
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
-        att_masks = att_masks[None, :]
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=embs.device)
 
         seq_len = pad_masks.shape[1]
-        if seq_len < self.prefix_length:
-            embs = pad_tensor(embs, self.prefix_length, pad_value=0)
-            pad_masks = pad_tensor(pad_masks, self.prefix_length, pad_value=0)
-            att_masks = pad_tensor(att_masks, self.prefix_length, pad_value=0)
-
+        if seq_len < self.config.prefix_length:
+            embs = add_padding_to_tensor(embs, self.prefix_length, 0)
+            pad_masks = add_padding_to_tensor(pad_masks, self.prefix_length, 0)
+            att_masks = add_padding_to_tensor(att_masks, self.prefix_length, 0)
         att_masks = att_masks.expand(bsize, -1)
-
+                                    
         return embs, pad_masks, att_masks
+
+
 
     def embed_suffix(self, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
-        embs = [] # actual token embeddings [Batch_size, action_chunk_len, representation_dim]
-        pad_masks = [] # real suffix tokens vs padding 
-        att_masks = [] # attention structure between suffix tokens
+        embs = []
+        pad_masks = [] 
 
-        # Fuse timestep + action information using an MLP
-        action_emb = self.action_in_proj(noisy_actions) # map actions dimension to expert hidden size
-        device = action_emb.device
+        action_emb = self.action_in_proj(nosiy_actions)
         bsize = action_emb.shape[0]
-        dtype = action_emb.dtype
-        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
+        dtype = action_emb.dtype 
+
         time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.vlm_with_expert.expert_hidden_size,
-            self.config.min_period,
-            self.config.max_period,
-            device=device,
+            timestep, 
+            self.config.ae_hidden_dim, 
+            self.config.min_period, 
+            self.config.max_period, 
+            dtype=dtype,
+            device=device
         )
-        time_emb = time_emb.type(dtype=dtype)
+        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
-        time_emb = time_emb[:, None, :].expand_as(action_emb) # create timestamp embedding for each action token in the chunk
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2) # concatenate action and timestamp information
-
-        # Fuse action + timestep with an MLP to create a single embedding for each action token in the chunk
-        action_time_emb = self.action_time_mlp_in(action_time_emb)
-        action_time_emb = F.silu(action_time_emb)  # swish == silu (sigmoid linear unit)
-        action_time_emb = self.action_time_mlp_out(action_time_emb)
-
-        # Add to input tokens
+        action_time_emb = self.action_time_mlp(action_time_emb)
+        action_time_dim = action_time_emb.shape[1]
         embs.append(action_time_emb)
 
-        bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device) # all action tokens are real tokens
+        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=self.config.device)
         pad_masks.append(action_time_mask)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] * self.config.chunk_size # this tells make_att_2d_masks() that every action token 
-        # starts a new causal attention block 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
-        return embs, pad_masks, att_masks
+        att_masks = torch.ones(config.action_chunk_size, dtype=embs.dtype, device=config.device).expand(bsize, -1)
+        return embs, pad_masks, att_masks 
 
-    def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
-    ) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
+        
+
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs: Unpack[ActionSelectKwargs],) -> Tensor:
+
+        past_key_values = DynamicCache()
+
+        models = [self.get_vlm_model().text_model, self.lm_expert]
+        model_layers = self.get_model_layers(models)
+        past_key_values = DynamicCache()
+        bsize = state.shape[0]
+        
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1 
+
+        # fill up the K/V cache of the VLM 
+        for layer_idx in range(self.config.num_vlm_layers):
+            layer = model_layers[0][layer_idx]
+            prefix_embs, past_key_values = self.self_attention(
+                model_layer=layer,
+                layer_idx=layer_idx,
+                input_embeds=prefix_embs,
+                position_ids=prefix_position_ids,
+                attention_mask=prefix_att_masks,
+                past_key_values=past_key_values,
+                do_training=False
+            )
+            
+
+        return self.euler_integration(
+            noise,
+            past_key_values,
+
+        )
+
+    def project_input_embs(self, layer, input_embs):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.config.self_attn.head_dim)
+
+        hidden_states = input_embs.to(dtype=layer.self_attn.q_proj.weight.layer)
+        hidden_states = layer.input_layernorm(hidden_states)
+        queries = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
+        keys = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
+        values = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
+
+        return queries, keys, values
+                                                                   
+
+
+    def concat_vlm_ae_tokens(self, layer_idx, model_layers, input_embs):
+        query_states = []
+        key_states = []
+        value_states = []
+
+        for i, hidden_states in enumerate(input_embs):
+            layer = model_layers[i][layer_idx]
+            if hidden_states is None or layer is None:
+                continue 
+
+            queries, keys, values = self.project_input_embs(layer, hidden_states)
+            query_states.append(queries)
+            key_states.append(keys)
+            value_states.append(values)
+
+        query_states = torch.cat(query_states, dim=1)
+        key_states = torch.cat(key_states, dim=1)
+        value_states = torch.cat(value_states, dim=1)
+        # Check if we need to control the sequence length with the position id length? 
+
+        return query_states, key_states, value_states
+
+
+
+    def self_attention(self, model_layers, layer_idx, input_embeds, positions_ids, attn_mask, past_key_values, do_training):
+
+        if do_training:
+            queries, keys, values = self.concat_vlm_ae_tokens(
+            layer_idx, model_layers, input_embeds
+            )
+
+            # Save the KV into the cache
+            past_key_values.update(
+                keys.transpose(1, 2),
+                values,transpoes(1, 2), 
+                layer_idx
+            )
+        else:
+            # retrieve KV from past_key_values 
+            vlm_keys = past_key_values.layers[layer_idx].keys.transpose(1, 2) 
+            vlm_values = past_key_values.layers[layer_idx].values.transpose(1, 2)
+
+            # project ae tokens 
+            layer = model_layers[1][layer_idx]
+            queries, keys, values = self.project_input_embs(layer, input_embeds)
+
+            # concat keys and values 
+            keys = torch.cat([vlm_keys, keys], dim=1)
+            values = torch.cat([vlm_vlaues, values], dim=1)
+
+        # apply rope here? 
+            
+        att_ouput = self.grouped_query_attention(
+            queries,
+            keys,
+            values,
+            attention_mask=attn_mask
+        )
+        return [att_ouput], past_key_values
+
+
+
+            
+
+    def cross_attention(self, model_layers, layer_idx, input_embeds, position_ids, attn_mask, past_key_values):
+        att_output = []
+
+        # ================== VLM ==============================
+        if past_key_values is None:
+            # TRAINING: Perform self-attention for the VLM 
+            vlm_seq_len = input_embeds[0].shape[1]
+            prefix_attn_mask = attention_mask[:, :vlm_seq_len, :vlm_seq_len]
+            layer = model_layers[0][layer_idx]
+
+            queries, keys, values = project_input_embs(layer, input_embeds[0])
+
+            # apply RoPE here? 
+
+            att_output.append(self.grouped_query_attention(
+                queries=queries,
+                keys=keys,
+                values=values,
+                attention_mask=preifx_attn_mask
+            ))
+        else:
+            # INFERENCE: Retrieve KV 
+            keys = past_key_values.layers[layer_idx].keys.transpose(1, 2)
+            values = past_key_values.layers[layer_idx].values.transpose(1, 2)
+
+            
+
+        # ############## Action Expert =========================
+        e_layer = model_layers[1][layer_idx]
+        e_hidden_states = e_layer.input_layernorm(input_embeds[1])
+        dtype = layer.self_attn.k_proj.weight.dtype 
+        e_hidden_states = e_hidden_states.to(dtype=dtype)
+        e_input_shape = e_hidden_states.shape[:-1]
+        e_hidden_shape = (*e_input_shape, -1, e_layer.self.self_attn.head_dim)
+        e_query_len = input_embeds[1].shape[1]
+        
+        e_queries = e_layer.self_attn.q_proj(e_hidden_states).view(e_hidden_shape)
+
+        vlm_keys = keys.to(dtype=dtype).reshape(*keys.shape[:2], -1)
+        vlm_values = values.to(dtype=dtype).reshape(*values.shape[:2], -1)
+
+        # project vlm KV tokens to action experts dimension utilizing a linear layer
+        e_shape = (*vlm_keys.shape[:2], -1)
+        _vlm_keys = e_layer.self_attn.k_proj(vlm_keys).view(e_shape)
+        _vlm_values = e_layer.self_attn.v_proj(vlm_values).view(e_shape)
+
+        # apply rope to ae queries? 
+
+
+        suffix_attn_mask = attention_mask[:, -e_query_len:, -_vlm_keys.shape[1]:]
+        att_output.append(grouped_query_attention(
+            queries=e_queries,
+            keys=_vlm_keys,
+            values=_vlm_values,
+            attention_mask=suffix_attn_mask                
+        ))
+
+        return att_output
+
+
+    def post_attention_processing(self, layer, first_residual, att_output):
+        assert first_residual is not None, "Input embeds stream does not exist during post attention processing!"
+        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+        out_emb = layer.self_attn.o_proj(att_output)
+        out_emb += first_residual  
+        second_residual = out_emb.clone()
+        out_emb = layer.post_attention_layernorm(out_emb)
+        out_emb = layer.mlp(out_emb)
+        out_emb += second_residual
+        return out_emb
+
+
+
+    def grouped_query_attention(self, queries, keys, values, attention_mask):
+
+        head_dim = self.config.head_dim 
+        num_att_heads = self.config.num_att_heads
+        num_kv_heads = self.config.num_kv_heads
+        num_kv_groups = num_att_heads // num_kv_heads
+        big_neg = torch.finfo(torch.float32).min 
+
+
+        batch_size, seq_len = keys.shape[:2]
+
+        keys = keys.unsqueeze(3).expand(batch_size, seq_len, num_kv_heads, num_kv_groups, head_dim)
+        keys = keys.reshape(batch_size, seq_len, num_kv_heads * num_kv_groups, head_dim)
+        values = values.unsequeeze(3).expand(batch_size, seq_len, num_kv_heads, num_kv_groups, head_dim)
+        values = values.reshape(batch_size, seq_len, num_kv_heads * num_kv_groups, head_dim)
+
+        queries = queries.to(dtype=torch.float32)
+        keys = keys.to(dtype=torch.float32)
+        
+        queries = queries.transpose(1, 2)
+        keys = keys.transpose(1, 2)
+
+        att_weights = torch.matmul(queries, keys,transpose(2,3)) * (head_dim**-0.5)
+        att_weights = att_weights.to(dtype=torch.float32)
+        logits = torch.where(attention_mask.unsqueeze(1), att_weights, big_neg)
+        probs = nn.functional.softmax(logits, dim=-1)
+        probs = probs.to(dtype=values.dtype)
+        
+        att_output = torch.matmul(probs, values.permute(0, 2, 1, 3))
+        att_output = att_ouput.permute(0, 2, 1, 3)
+        return att_output.reshape(batch_size, -1, num_kv_heads * num_kv_groups * head_dim)
+        
+
+
+
+    """
+        Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)
+    """
+    def forward(self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None):
+
+
         if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
+            noise = self.sample_noise(actions.shape, self.config.device)
 
         if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+            time = self.sample_time(action.shape[0], self.config.device)
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+
+        # interpolation is inverted compared to standard flow matching, but mathematically 
+        # equivalent and implied by Black et al. (2024)
+        t = time[:, None, None] 
+        x_t = t * noise + (1 - t) * actions 
+        v_t_target = noise - actions 
+
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images=images, img_masks=img_masks, lang_tokens=lang_tokens, lang_masks=lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
-
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-        (_, suffix_out), _ = self.vlm_with_expert.forward(
-            attention_mask=att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, suffix_embs],
-            use_cache=False,
-        )
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        # original openpi code, upcast attention output
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        losses = F.mse_loss(u_t, v_t, reduction="none")
-        return losses
-
-    """
-        this function is used during inference to sample a chunk of future actions given the current robot observations.
-        it uses the Euler integration method to iteratively denoise the sampled noise and generate a sequence of actions.
-
-        Calling frequency: every timestep t (and if action queue is empty)
-        args:
-            images: List of image tensors (batch_size x num_images x channels x height x width).
-            img_masks: List of image padding masks (batch_size x num_images).
-            lang_tokens: Language tokens tensor (batch_size x seq_len).
-            lang_masks: Language attention masks tensor (batch_size x seq_len).
-            state: Robot state tensor (batch_size x state_dim).
-            noise: Optional noise tensor for flow matching. If None, it will be sampled.
-            **kwargs: Additional keyword arguments for RTC processing.
-        returns:
-            tensor: Sampled actions (batch_size x num_steps x num_motors).
-    """
-    def sample_actions(
-        self,
-        images,
-        img_masks,
-        lang_tokens,
-        lang_masks,
-        state,
-        noise=None,
-        **kwargs: Unpack[ActionSelectKwargs],
-    ) -> Tensor:
-        bsize = state.shape[0]
-        device = state.device
-
-        if noise is None:
-            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
-            noise = self.sample_noise(actions_shape, device)
-
-        # Turn image, language and state into conditioning representation for the action-generation process
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
+            noisy_actions=x_t, timestep=time
         )
 
-        # determine which tokens are allowed to attend to which other tokens -> tells the transformer how information
-        # is allowed to flow between the different parts of the input. 
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks) 
-        # generate position ids 
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        """ 
-            Compute image and language key value cache.
+        padding_mask = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        attention_mask = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
+        att_pad_masks = create_attention_mask(padding_mask, attention_mask) 
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1 # basic position ids, which skip padding, not documented in the paper 
 
-            The KV cache is reused for every Tau timestep of the action chunk generation process, since 
-            the observation doesn't change during the action chunk generation. KV cache is set to None
-            for new observation timesteps t. 
+        # During training perform only self-attention by 
+        # - projecting each tokens for VLM and AE separately
+        # - concatenate the VLM QKV with the AE QKV 
+        # - compute attention on concatenated QKV 
+        models = [self.get_vlm_model().text_model, self.expert]
+        model_layers = self.get_model_layers(models)
+        input_embs = [prefix_embs, suffix_embs]
 
-        """
-        print("\nForwarding VLM with expert to compute past_key_values for prefix embeddings...\n")
-        _, past_key_values = self.vlm_with_expert.forward(
-            attention_mask=prefix_att_2d_masks, 
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=self.config.use_cache,
-        )
-        num_steps = self.config.num_steps
+        for layer_idx in range(self.num_vlm_layers):
+            
+            output_embeds = []
+            attention_mask_, position_ids_ = adapt_mask_and_position_length(attention_mask, position_ids, query_states.shape[1])
 
-        print("\nStarting Euler integration to generate action chunk...\n")
-        return euler_integrate(
-            lambda input_x_t, current_timestep: self.denoise_step(
-                x_t=input_x_t,
-                prefix_pad_masks=prefix_pad_masks,
-                past_key_values=past_key_values,
-                timestep=current_timestep,
-            ),
-            noise,
-            num_steps,
-            rtc_processor=self.rtc_processor,
-            rtc_enabled=self._rtc_enabled(),
-            inference_delay=kwargs.get("inference_delay"),
-            prev_chunk_left_over=kwargs.get("prev_chunk_left_over"),
-            execution_horizon=kwargs.get("execution_horizon"),
-        )
+            if layer_idx % self.config.self_attn_every_n_layers == 0:
 
+                att_outputs, _ = self.self_attention(
+                    model_layers,
+                    layer_idx, 
+                    input_embs,
+                    position_ids,
+                    attention_mask,
+                    past_key_values=None,
+                    do_training=True
+                )
 
-    """
-        @brief: This function is the core operation performed once per flow-matching denoising step.
-                Take the current noisy action chunk x_t, let the Action Expert predict its velocity 
-                v_t, and return the velocity to the Euler integration function.
+                for i, hidden_states in enumerate(input_embs):
+                    layer = model_layers[i][layer_idx]
+                    if layer is None:
+                        output_embeds.append(hidden_states) # pass hidden_states to the next layer 
+                    else:
+                        output_embeds.append(self.post_attention_processing(
+                            layer,
+                            hidden_states,
+                            att_outputs[0]
+                        ))
 
-        @params:
-        - prefix_pad_masks: tells the model which VLM prefix tokens are valid and which are padding.
-        - past_key_values: the cahed VLM K/V representations created before the denoising loop. 
-        - x_t current noisy action chunk at timestep t.
-        - timestep: current t, e.g. 1.0, 0.9, ..., 0.0.
+            else: 
+                att_outputs = self.cross_attention(
+                    model_layers, 
+                    layer_idx,
+                    input_embs,
+                    positions_ids,
+                    attention_mask,
+                    past_key_values
+                )
 
-    """
-    def denoise_step(
-        self,
-        prefix_pad_masks,
-        past_key_values,
-        x_t,
-        timestep,
-    ):
+                for i, hidden_states in enumerate(input_embs):
+                    layer = model_layers[i][layer_idx]
+                    if layer is None:
+                        output_embeds.append(hidden_states)
+                    else:
+                        output_embeds.append(self.post_attention_processing(
+                            layer=layer,
+                            first_residual=hidden_states,
+                            att_output=att_outputs[i]
+                        ))
 
-        # convert the current action chunk x_t into embeddings suitable for the AE
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+            input_embs = output_embeds
 
-        # Prefix = observations (image, language and robot state tokens)
-        # Suffix = current noisy action chunk x_t
+        suffix_out = suffix_out[:, -self.config.chunk_size:] # remove the state tokens
 
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-        # [B, prefix_len] -> [B, suffix_len, prefix_len]
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        v_t_pred = self.action_out_proj(suffix_out)
+        return F.mse_loss(v_t_target, v_t_pred, reduction="none")
+        
 
-        # Ignore paddings and prevent that previous action tokens attend to future action tokens
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+    def denoise_step(self, prefix_pad_masks, past_key_values, x_t, timestep):
+        
+        suffix_embs, suffix_pad_masks, suffix_masks = self.embed_suffix(x_t, timestep)
+        suffix_len =  suffix_pad_masks.shape[1]
+        bsize, prefix_len = prefix_pad_masks.shape[:2]
+        prefix_pad_2d_masks = prefix_pad_masks.expand(bsize, suffix_len, prefix_len)
 
-        # combine prefix and suffix attention masks: [B, suffix_len, prefix_len] + [B, suffix_len, suffix_len]
-        # -> [B, suffix_len, prefix_len + suffix_len]
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-        # determine the RoPE position of each aciton token
+        suffix_att_2d_masks = create_attention_mask(suffis_pad_masks, suffix_att_masks)
+
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dime=2)
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        outputs_embeds, _ = self.vlm_with_expert.forward(
-            attention_mask=full_att_2d_masks,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs], # do not recompute VLM 
-            use_cache=self.config.use_cache,
-        )
-        if past_key_values is not None:
-            # Self-attention layers append suffix K/V in place; restore the prefix for the next step
-            # by removing everything after the prefix length. 
-            past_key_values.crop(prefix_len)
-        suffix_out = outputs_embeds[1]
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)
-        return v_t
+        models = [self.get_vlm_model().text_model, self.lm_expert]
+        model_layers = self.get_model_layers(models)
+
+        for layer_idx in range(self.config.num_vlm_layers):
+            
+            layer = model_layers[1][layer_idx]
+            if layer_idx % self.config.every_n_layer_self_attn == 0:
+                att_outputs, past_key_values = self.self_attention(
+                    model_layer=layer,
+                    layer_idx=layer_idx, 
+                    input_embeds=suffix_embs,
+                    position_ids=positions_ids,
+                    attn_mask=full_att_2d_masks,
+                    past_key_values=past_key_values,
+                    do_training=False
+                )
+            else: 
+                att_outputs, past_key_values = self.cross_attention(
+                    model_layer=layer, 
+                    layer_idx=layer_idx,
+                    input_embeds=suffix_embs,
+                    position_ids=position_ids,
+                    attn_mask=full_att_2d_masks,
+                    past_key_values=past_key_values
+                )
+
+            # cross_attention returns [vlm_att_out, ae_att_out] and self attention [att_out]
+            # During inference only post process the last element inside the list
+            att_out = att_outputs[-1]
+            out_emb = self.post_attention_processing(
+                layer=layer,
+                first_residual=suffix_embs,
+                att_output=att_out
+            )
+            suffix_embs = out_emb
+
+        # Perform final layer normalization
+        return self.lm_expert.norm(suffix_embs)
+        
+
+
+
+
+    def euler_integration(self):
+
+        x_t = sample_noise(self.bsize, self.config.noise)     
+        dt = -1.0 / config.denoising_steps
+
+        for step in config.denoising_steps:
+            time = 1.0 + step * dt
+            time_t = torch.tensor(
+                time,
+                dtype=torch.float32,
+                device=self.config.device
+            ).expand(self.bsize)
+            velocity = self.denoise_step(prefix_pad_masks, past_key_values, x_t, timestep)
+            x += velocity  * dt
+
+        return x
