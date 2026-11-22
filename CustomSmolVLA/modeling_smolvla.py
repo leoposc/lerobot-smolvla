@@ -10,6 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 from dataclasses import dataclass 
 
+import copy
 import math 
 from collections import deque 
 from typing import TypedDict, Unpack 
