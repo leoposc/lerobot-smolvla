@@ -2,6 +2,8 @@ import torch
 from torch import Tensor
 import math 
 
+from lerobot.utils.device_utils import get_safe_dtype
+
 
 def sample_beta(bsize, device):
     alpha_t = torch.tensor(1.5, dtype=torch.float32)
@@ -12,7 +14,7 @@ def sample_beta(bsize, device):
 def sample_time(bsize, device):
     time_beta = sample_beta(bsize, device)
     time = time_beta * 0.999 + 0.001
-    return time.to(dype=torch.float32, device=device)
+    return time.to(dtype=torch.float32, device=device)
 
 
 def sample_noise(shape, device):
@@ -36,7 +38,7 @@ def create_sinusodial_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape '(batch_size, )'.")
 
-    dtype = get_safe_dtype(torch.float64, device.type)
+    dtype = get_safe_dtype(torch.float64, device)
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction 
 
