@@ -30,7 +30,7 @@ from lerobot.processor import (
 from .configuration_smolvla import SmolVLAConfig
 
 
-def make_smolvla_pre_post_processors(
+def make_custom_smolvla_pre_post_processors(
     config: SmolVLAConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
