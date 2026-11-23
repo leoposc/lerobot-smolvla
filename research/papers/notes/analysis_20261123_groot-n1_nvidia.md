@@ -1,5 +1,3 @@
----
-name: research-assistant
 
 # Groot N1 Analysis - Parameter-Efficient VLA Adaptation
 
