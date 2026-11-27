@@ -71,7 +71,7 @@ def create_attention_mask(pad_masks, att_masks):
 def adapt_mask_and_position_length(attn_mask, pos_ids, seq_len):
     if seq_len < pos_ids.shape[1]:
         _pos_ids = pos_ids[:, :seq_len]
-        _attn_mask = attn_mask[:, seq_len, :seq_len]
+        _attn_mask = attn_mask[:, :seq_len, :seq_len]
     else:
         _pos_ids = pos_ids 
         _attn_mask = attn_mask 
