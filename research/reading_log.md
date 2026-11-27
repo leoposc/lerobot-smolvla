@@ -52,3 +52,17 @@
 **Your confirmation required:** `"I have read smolvla-vla-shukor-aubakirova-capuano-kooijmans-palma-zouitine-aractingi-bonafede-pascal-russi-marafioti-alibert-cord-wolf-cadene-2025"` — DO NOT assume reading based on my analysis, PDF extraction, or web search alone.
 
 *(My analysis above is a summary of what I found from arXiv pages 1–15. Only you can confirm "I have read X" and set this entry to `read` status in index.csv.)*
+
+---
+
+## 2026-11-23 – GRNVIDIA
+
+GR00T N1: An Open Foundation Model for Generalist Humanoid Robots
+
+| Field | Value | Source/Verified? |
+|-------|--------|------------------|
+| Status | `queued` | Explicit confirmation pending |
+| Papers previously read | 5 (from session context) | Session memory |
+| Notes | See analysis_20261123_groot-n1_nvidia.md for full extraction | PDF text extracted via pdftotext |
+
+---
