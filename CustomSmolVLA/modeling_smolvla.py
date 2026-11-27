@@ -975,19 +975,10 @@ class FlowMatching(nn.Module):
 
 
 
-    def euler_integration(self):
-
-        x_t = sample_noise(self.bsize, self.config.noise)     
-        dt = -1.0 / config.denoising_steps
-
-        for step in config.denoising_steps:
+        for step in range(self.config.num_steps):
             time = 1.0 + step * dt
-            time_t = torch.tensor(
-                time,
-                dtype=torch.float32,
-                device=self.config.device
-            ).expand(self.bsize)
-            velocity = self.denoise_step(prefix_pad_masks, past_key_values, x_t, timestep)
-            x += velocity  * dt
+            time_t = torch.full((bsize,), time, dtype=torch.float32, device=noise.device)
+            velocity = self.denoise_step(prefix_pad_masks, past_key_values, x_t, time_t)
+            x_t = x_t + velocity * dt
 
-        return x
+        return x_t
