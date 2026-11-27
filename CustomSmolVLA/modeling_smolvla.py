@@ -19,7 +19,9 @@ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LAN
 from lerobot.utils.import_utils import require_package 
 from lerobot.policies.common.vla_utils import resize_with_pad, pad_vector
 
-from lerobot.policies.pretrained import PreTrainedPolicy 
+from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+from lerobot.policies.utils import populate_queues
 
 from .configuration_smolvla import SmolVLAConfig 
 
@@ -41,6 +43,12 @@ from .custom_utils import (
     add_padding_to_tensor,
     create_attention_mask,
     create_sinusodial_pos_embedding
+)
+from .smolvlm_with_expert import apply_rope, get_intermediate_size
+from .modeling_smolvla_original import (
+    aloha_gripper_from_angular,
+    aloha_gripper_from_angular_inv,
+    aloha_gripper_to_angular,
 )
 
 
@@ -431,31 +439,79 @@ class FlowMatching(nn.Module):
 
         self.vlm = AutoModelForImageTextToText.from_pretrained(
             "HuggingFaceTB/SmolVLM2-500M-Video-Instruct", 
-            torch_dtype="bfloat16",
+            dtype="bfloat16",
             low_cpu_mem_usage=True
         )
         self.vlm_config = self.vlm.config
         self.text_config = copy.deepcopy(self.vlm_config.text_config)
-        self.expert = AutoModel.from_config(self.text_config)
+
+        # Only keep the first num_vlm_layers layers of the VLM
+        if config.num_vlm_layers > 0:
+            self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:config.num_vlm_layers]
         self.num_vlm_layers = len(self.get_vlm_model().text_model.layers)
 
-        self.action_in_proj = nn.Linear(config.max_action_dim, self.text_config.hidden_size)
-        self.action_out_proj = nn.Linear(self.text_config.hidden_size, config.max_action_dim)
+        # Smaller action expert: narrower hidden size, but the same number and size of attention heads
+        # as the VLM, so their QKV can still be concatenated in the self-attention layers
+        self.expert_config = copy.deepcopy(self.text_config)
+        expert_hidden_size = int(self.text_config.hidden_size * config.expert_width_multiplier)
+        self.expert_config.hidden_size = expert_hidden_size
+        self.expert_config.intermediate_size = get_intermediate_size(expert_hidden_size)
+        self.expert_config.num_hidden_layers = self.num_vlm_layers
+        if config.num_expert_layers > 0:
+            assert self.num_vlm_layers % config.num_expert_layers == 0, (
+                f"Number of layers in the VLM {self.num_vlm_layers} are not multiple of num_expert_layers {config.num_expert_layers}"
+            )
+            self.expert_config.num_hidden_layers = config.num_expert_layers
+        self.lm_expert = AutoModel.from_config(self.expert_config)
+        self.num_expert_layers = len(self.lm_expert.layers)
 
-        # self.q_proj = nn.Linear(self.text_config.ae_hidden_dim, self.text_config.ae_hidden_dim)
-        # self.v_proj = nn.Linear(condig.ae_hidden_dim, self.text_config.hidden_size)
-        # self.k_proj = nn.Linear(condig.ae_hidden_dim, self.text_config.hidden_size)
+        if "cross" in config.attention_mode:
+            # In the cross-attention layers the expert projects the cached VLM keys/values,
+            # so their k_proj/v_proj take the VLM KV width as input
+            vlm_kv_dim = self.text_config.num_key_value_heads * self.text_config.head_dim
+            expert_kv_dim = self.expert_config.num_key_value_heads * self.expert_config.head_dim
+            for layer_idx in range(self.num_expert_layers):
+                if config.self_attn_every_n_layers > 0 and layer_idx % config.self_attn_every_n_layers == 0:
+                    continue
+                self.lm_expert.layers[layer_idx].self_attn.k_proj = nn.Linear(
+                    vlm_kv_dim, expert_kv_dim, bias=self.expert_config.attention_bias
+                )
+                self.lm_expert.layers[layer_idx].self_attn.v_proj = nn.Linear(
+                    vlm_kv_dim, expert_kv_dim, bias=self.expert_config.attention_bias
+                )
+        # The expert only receives embeddings, it never embeds tokens itself
+        self.lm_expert.embed_tokens = None
 
+        self.action_in_proj = nn.Linear(config.max_action_dim, expert_hidden_size)
+        self.action_out_proj = nn.Linear(expert_hidden_size, config.max_action_dim)
+
+        # The state token is part of the VLM prefix, so it is projected to the VLM hidden size
         self.state_proj = nn.Linear(
             config.max_state_dim, self.text_config.hidden_size
         )
 
         self.action_time_mlp_in = nn.Linear(
-            self.text_config.hidden_size * 2, self.text_config.hidden_size
+            expert_hidden_size * 2, expert_hidden_size
         )
         self.action_time_mlp_out = nn.Linear(
-            self.text_config.hidden_size, self.text_config.hidden_size
+            expert_hidden_size, expert_hidden_size
         )
+
+        self.set_requires_grad()
+
+    def set_requires_grad(self):
+        # The whole VLM (vision encoder + text layers) stays frozen, only the action expert and the projections are trained
+        if not self.config.train_expert_only:
+            raise ValueError("CustomSmolVLA never trains the VLM, `train_expert_only=False` is not supported.")
+        self.vlm.eval()
+        self.vlm.requires_grad_(False)
+        self.state_proj.requires_grad_(self.config.train_state_proj)
+
+    def train(self, mode: bool = True):
+        # Keep the frozen VLM in eval mode, even when lerobot-train calls policy.train()
+        super().train(mode)
+        self.vlm.eval()
+        return self
 
 
     def get_vlm_model(self):
@@ -575,7 +631,7 @@ class FlowMatching(nn.Module):
 
         time_emb = create_sinusodial_pos_embedding(
             timestep,
-            self.text_config.hidden_size,
+            self.expert_config.hidden_size,
             self.config.min_period,
             self.config.max_period,
             o_dtype=dtype,
@@ -601,176 +657,184 @@ class FlowMatching(nn.Module):
         
 
     def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state, noise=None, **kwargs: Unpack[ActionSelectKwargs],) -> Tensor:
-
-        past_key_values = DynamicCache()
-
-        models = [self.get_vlm_model().text_model, self.lm_expert]
-        model_layers = self.get_model_layers(models)
-        past_key_values = DynamicCache()
         bsize = state.shape[0]
-        
+        device = state.device
+
+        if noise is None:
+            noise = sample_noise((bsize, self.config.chunk_size, self.config.max_action_dim), device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1 
+        prefix_att_2d_masks = create_attention_mask(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
-        # fill up the K/V cache of the VLM 
-        for layer_idx in range(self.config.num_vlm_layers):
-            layer = model_layers[0][layer_idx]
-            prefix_embs, past_key_values = self.self_attention(
-                model_layer=layer,
-                layer_idx=layer_idx,
-                input_embeds=prefix_embs,
-                position_ids=prefix_position_ids,
-                attention_mask=prefix_att_masks,
-                past_key_values=past_key_values,
-                do_training=False
-            )
-            
-
-        return self.euler_integration(
-            noise,
-            past_key_values,
-
+        # fill up the K/V cache of the VLM: every layer performs self-attention on the prefix only.
+        # The prefix does not change during denoising, so this is done once per action chunk.
+        past_key_values = {}
+        self.forward_layers(
+            input_embs=[prefix_embs, None],
+            position_ids=prefix_position_ids,
+            attn_mask=prefix_att_2d_masks,
+            past_key_values=past_key_values,
+            fill_kv_cache=True,
         )
 
-    def project_input_embs(self, layer, input_embs):
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.config.self_attn.head_dim)
+        return self.euler_integration(noise, prefix_pad_masks, past_key_values)
 
-        hidden_states = input_embs.to(dtype=layer.self_attn.q_proj.weight.layer)
-        hidden_states = layer.input_layernorm(hidden_states)
+    def project_input_embs(self, layer, input_embs):
+        hidden_states = layer.input_layernorm(input_embs)
+        hidden_states = hidden_states.to(dtype=layer.self_attn.q_proj.weight.dtype)
+
+        # (B, L, hidden) -> (B, L, num_heads, head_dim)
+        hidden_shape = (*hidden_states.shape[:-1], -1, layer.self_attn.head_dim)
         queries = layer.self_attn.q_proj(hidden_states).view(hidden_shape)
         keys = layer.self_attn.k_proj(hidden_states).view(hidden_shape)
         values = layer.self_attn.v_proj(hidden_states).view(hidden_shape)
 
         return queries, keys, values
-                                                                   
+
 
 
     def concat_vlm_ae_tokens(self, layer_idx, model_layers, input_embs):
         query_states = []
         key_states = []
         value_states = []
+        seq_lens = []  # number of tokens each stream contributes, used to split the attention output again
 
         for i, hidden_states in enumerate(input_embs):
             layer = model_layers[i][layer_idx]
             if hidden_states is None or layer is None:
-                continue 
+                seq_lens.append(None)
+                continue
 
             queries, keys, values = self.project_input_embs(layer, hidden_states)
             query_states.append(queries)
             key_states.append(keys)
             value_states.append(values)
+            seq_lens.append(hidden_states.shape[1])
+
+        if not query_states:
+            return None, None, None, seq_lens
 
         query_states = torch.cat(query_states, dim=1)
         key_states = torch.cat(key_states, dim=1)
         value_states = torch.cat(value_states, dim=1)
-        # Check if we need to control the sequence length with the position id length? 
 
-        return query_states, key_states, value_states
-
+        return query_states, key_states, value_states, seq_lens
 
 
-    def self_attention(self, model_layers, layer_idx, input_embeds, positions_ids, attn_mask, past_key_values, do_training):
 
-        if do_training:
-            queries, keys, values = self.concat_vlm_ae_tokens(
-            layer_idx, model_layers, input_embeds
-            )
+    def self_attention(self, model_layers, layer_idx, input_embs, position_ids, attn_mask, past_key_values=None, fill_kv_cache=False):
+        """
+            Joint attention over the concatenated VLM and AE tokens. Used for
+            - training:        input_embs = [prefix, suffix], no cache
+            - filling the KV cache: input_embs = [prefix, None]
+            - denoising:       input_embs = [None, suffix], the AE tokens attend to the cached prefix and themselves
+        """
+        queries, keys, values, seq_lens = self.concat_vlm_ae_tokens(layer_idx, model_layers, input_embs)
+        if queries is None:
+            return [None] * len(input_embs)
 
-            # Save the KV into the cache
-            past_key_values.update(
-                keys.transpose(1, 2),
-                values,transpoes(1, 2), 
-                layer_idx
-            )
-        else:
-            # retrieve KV from past_key_values 
-            vlm_keys = past_key_values.layers[layer_idx].keys.transpose(1, 2) 
-            vlm_values = past_key_values.layers[layer_idx].values.transpose(1, 2)
+        # If the AE has no layer here, only the prefix tokens were projected
+        attn_mask, position_ids = adapt_mask_and_position_length(attn_mask, position_ids, queries.shape[1])
 
-            # project ae tokens 
-            layer = model_layers[1][layer_idx]
-            queries, keys, values = self.project_input_embs(layer, input_embeds)
+        # RoPE encodes the token positions into Q/K (where to look), not into V (what is retrieved)
+        queries = apply_rope(queries, position_ids)
+        keys = apply_rope(keys, position_ids)
 
-            # concat keys and values 
+        if fill_kv_cache:
+            # Save the (post-RoPE) prefix KV into the cache
+            past_key_values[layer_idx] = (keys, values)
+        elif past_key_values is not None:
+            # Retrieve the prefix KV from the cache and concat them with the AE keys and values
+            vlm_keys, vlm_values = past_key_values[layer_idx]
             keys = torch.cat([vlm_keys, keys], dim=1)
-            values = torch.cat([vlm_vlaues, values], dim=1)
+            values = torch.cat([vlm_values, values], dim=1)
 
-        # apply rope here? 
-            
-        att_ouput = self.grouped_query_attention(
-            queries,
-            keys,
-            values,
-            attention_mask=attn_mask
-        )
-        return [att_ouput], past_key_values
+        att_output = self.grouped_query_attention(queries, keys, values, attention_mask=attn_mask)
+
+        # Split the attention output back into one output per stream
+        att_outputs = []
+        start = 0
+        for seq_len in seq_lens:
+            if seq_len is None:
+                att_outputs.append(None)
+                continue
+            att_outputs.append(att_output[:, start:start + seq_len])
+            start += seq_len
+        return att_outputs
 
 
 
-            
-
-    def cross_attention(self, model_layers, layer_idx, input_embeds, position_ids, attn_mask, past_key_values):
-        att_output = []
+    def cross_attention(self, model_layers, layer_idx, input_embs, position_ids, attn_mask, past_key_values=None, fill_kv_cache=False):
+        """
+            The AE queries attend to the VLM keys/values of the same layer, projected by the AE k_proj/v_proj.
+            Used for
+            - training:  input_embs = [prefix, suffix], the VLM performs self-attention on the prefix
+            - denoising: input_embs = [None, suffix], the VLM keys/values come from the cache
+        """
+        prefix_embs, suffix_embs = input_embs
+        att_outputs = [None, None]
 
         # ================== VLM ==============================
-        if past_key_values is None:
-            # TRAINING: Perform self-attention for the VLM 
-            vlm_seq_len = input_embeds[0].shape[1]
-            prefix_attn_mask = attention_mask[:, :vlm_seq_len, :vlm_seq_len]
+        if prefix_embs is not None:
+            # TRAINING: Perform self-attention for the VLM
+            vlm_seq_len = prefix_embs.shape[1]
+            prefix_attn_mask = attn_mask[:, :vlm_seq_len, :vlm_seq_len]
+            prefix_position_ids = position_ids[:, :vlm_seq_len]
+            expert_position_ids = position_ids[:, vlm_seq_len:]
+
             layer = model_layers[0][layer_idx]
+            queries, keys, values = self.project_input_embs(layer, prefix_embs)
+            queries = apply_rope(queries, prefix_position_ids)
+            keys = apply_rope(keys, prefix_position_ids)
 
-            queries, keys, values = project_input_embs(layer, input_embeds[0])
-
-            # apply RoPE here? 
-
-            att_output.append(self.grouped_query_attention(
+            att_outputs[0] = self.grouped_query_attention(
                 queries=queries,
                 keys=keys,
                 values=values,
-                attention_mask=preifx_attn_mask
-            ))
+                attention_mask=prefix_attn_mask
+            )
         else:
-            # INFERENCE: Retrieve KV 
-            keys = past_key_values.layers[layer_idx].keys.transpose(1, 2)
-            values = past_key_values.layers[layer_idx].values.transpose(1, 2)
-
-            
+            # INFERENCE: Retrieve KV
+            keys, values = past_key_values[layer_idx]
+            expert_position_ids = position_ids
 
         # ############## Action Expert =========================
         e_layer = model_layers[1][layer_idx]
-        e_hidden_states = e_layer.input_layernorm(input_embeds[1])
-        dtype = layer.self_attn.k_proj.weight.dtype 
-        e_hidden_states = e_hidden_states.to(dtype=dtype)
-        e_input_shape = e_hidden_states.shape[:-1]
-        e_hidden_shape = (*e_input_shape, -1, e_layer.self.self_attn.head_dim)
-        e_query_len = input_embeds[1].shape[1]
-        
+        if e_layer is None or suffix_embs is None:
+            return att_outputs
+
+        e_hidden_states = e_layer.input_layernorm(suffix_embs)
+        e_hidden_states = e_hidden_states.to(dtype=e_layer.self_attn.q_proj.weight.dtype)
+        e_hidden_shape = (*e_hidden_states.shape[:-1], -1, e_layer.self_attn.head_dim)
+        e_query_len = suffix_embs.shape[1]
+
         e_queries = e_layer.self_attn.q_proj(e_hidden_states).view(e_hidden_shape)
 
-        vlm_keys = keys.to(dtype=dtype).reshape(*keys.shape[:2], -1)
-        vlm_values = values.to(dtype=dtype).reshape(*values.shape[:2], -1)
+        # (B, L, num_kv_heads, head_dim) -> (B, L, num_kv_heads * head_dim)
+        vlm_keys = keys.to(dtype=e_layer.self_attn.k_proj.weight.dtype).reshape(*keys.shape[:2], -1)
+        vlm_values = values.to(dtype=e_layer.self_attn.v_proj.weight.dtype).reshape(*values.shape[:2], -1)
 
         # project vlm KV tokens to action experts dimension utilizing a linear layer
-        e_shape = (*vlm_keys.shape[:2], -1)
+        e_shape = (*vlm_keys.shape[:2], -1, e_layer.self_attn.head_dim)
         _vlm_keys = e_layer.self_attn.k_proj(vlm_keys).view(e_shape)
         _vlm_values = e_layer.self_attn.v_proj(vlm_values).view(e_shape)
 
-        # apply rope to ae queries? 
+        # The VLM keys already carry their RoPE positions, the AE query positions start from 0
+        expert_position_ids = expert_position_ids - torch.min(expert_position_ids, dim=1, keepdim=True).values
+        e_queries = apply_rope(e_queries, expert_position_ids)
 
-
-        suffix_attn_mask = attention_mask[:, -e_query_len:, -_vlm_keys.shape[1]:]
-        att_output.append(grouped_query_attention(
+        suffix_attn_mask = attn_mask[:, -e_query_len:, :_vlm_keys.shape[1]]
+        att_outputs[1] = self.grouped_query_attention(
             queries=e_queries,
             keys=_vlm_keys,
             values=_vlm_values,
-            attention_mask=suffix_attn_mask                
-        ))
+            attention_mask=suffix_attn_mask
+        )
 
-        return att_output
+        return att_outputs
 
 
     def post_attention_processing(self, layer, first_residual, att_output):
@@ -778,7 +842,7 @@ class FlowMatching(nn.Module):
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
             att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
         out_emb = layer.self_attn.o_proj(att_output)
-        out_emb += first_residual  
+        out_emb += first_residual
         second_residual = out_emb.clone()
         out_emb = layer.post_attention_layernorm(out_emb)
         out_emb = layer.mlp(out_emb)
@@ -788,37 +852,91 @@ class FlowMatching(nn.Module):
 
 
     def grouped_query_attention(self, queries, keys, values, attention_mask):
-
-        head_dim = self.config.head_dim 
-        num_att_heads = self.config.num_att_heads
-        num_kv_heads = self.config.num_kv_heads
+        # The AE uses the same attention heads as the VLM
+        head_dim = self.text_config.head_dim
+        num_att_heads = self.text_config.num_attention_heads
+        num_kv_heads = self.text_config.num_key_value_heads
         num_kv_groups = num_att_heads // num_kv_heads
-        big_neg = torch.finfo(torch.float32).min 
+        big_neg = torch.finfo(torch.float32).min
+
+        print("Peforming GQA: ")
+        print(f"Queries shape: {queries.shape}")
+        print(f"Keys shape: {keys.shape}")
+        print(f"Values shape: {values.shape}")
+        print("=" * 50, "\n")
 
 
         batch_size, seq_len = keys.shape[:2]
 
+        # Repeat every KV head for its group of query heads
         keys = keys.unsqueeze(3).expand(batch_size, seq_len, num_kv_heads, num_kv_groups, head_dim)
         keys = keys.reshape(batch_size, seq_len, num_kv_heads * num_kv_groups, head_dim)
-        values = values.unsequeeze(3).expand(batch_size, seq_len, num_kv_heads, num_kv_groups, head_dim)
+        values = values.unsqueeze(3).expand(batch_size, seq_len, num_kv_heads, num_kv_groups, head_dim)
         values = values.reshape(batch_size, seq_len, num_kv_heads * num_kv_groups, head_dim)
 
         queries = queries.to(dtype=torch.float32)
         keys = keys.to(dtype=torch.float32)
-        
+
         queries = queries.transpose(1, 2)
         keys = keys.transpose(1, 2)
 
-        att_weights = torch.matmul(queries, keys,transpose(2,3)) * (head_dim**-0.5)
+        att_weights = torch.matmul(queries, keys.transpose(2, 3)) * (head_dim**-0.5)
         att_weights = att_weights.to(dtype=torch.float32)
         logits = torch.where(attention_mask.unsqueeze(1), att_weights, big_neg)
         probs = nn.functional.softmax(logits, dim=-1)
         probs = probs.to(dtype=values.dtype)
-        
+
         att_output = torch.matmul(probs, values.permute(0, 2, 1, 3))
-        att_output = att_ouput.permute(0, 2, 1, 3)
+        att_output = att_output.permute(0, 2, 1, 3)
         return att_output.reshape(batch_size, -1, num_kv_heads * num_kv_groups * head_dim)
-        
+
+
+
+    def forward_layers(self, input_embs, position_ids, attn_mask, past_key_values=None, fill_kv_cache=False):
+        """
+            Pass the [prefix, suffix] streams through all layers. A stream is None if it is not computed
+            (the suffix while filling the KV cache, the prefix while denoising).
+        """
+        models = [self.get_vlm_model().text_model, self.lm_expert]
+        model_layers = self.get_model_layers(models)
+
+        for layer_idx in range(self.num_vlm_layers):
+            # While filling the KV cache every layer performs self-attention on the prefix
+            use_self_attn = (
+                fill_kv_cache
+                or "cross" not in self.config.attention_mode
+                or (self.config.self_attn_every_n_layers > 0 and layer_idx % self.config.self_attn_every_n_layers == 0)
+            )
+            print(f"Performing self-attention: {use_self_attn}")
+            attention = self.self_attention if use_self_attn else self.cross_attention
+            att_outputs = attention(
+                model_layers,
+                layer_idx,
+                input_embs,
+                position_ids,
+                attn_mask,
+                past_key_values=past_key_values,
+                fill_kv_cache=fill_kv_cache,
+            )
+
+            output_embs = []
+            for i, hidden_states in enumerate(input_embs):
+                layer = model_layers[i][layer_idx]
+                if hidden_states is None or layer is None or att_outputs[i] is None:
+                    output_embs.append(hidden_states) # pass hidden_states to the next layer
+                else:
+                    output_embs.append(self.post_attention_processing(
+                        layer=layer,
+                        first_residual=hidden_states,
+                        att_output=att_outputs[i]
+                    ))
+            input_embs = output_embs
+
+        # final layer normalization
+        return [
+            models[i].norm(hidden_states) if hidden_states is not None else None
+            for i, hidden_states in enumerate(input_embs)
+        ]
 
 
 
@@ -827,19 +945,18 @@ class FlowMatching(nn.Module):
     """
     def forward(self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None):
 
-
         if noise is None:
-            noise = sample_noise(actions.shape, self.config.device)
+            noise = sample_noise(actions.shape, actions.device)
 
         if time is None:
-            time = sample_time(action.shape[0], self.config.device)
+            time = sample_time(actions.shape[0], actions.device)
 
 
-        # interpolation is inverted compared to standard flow matching, but mathematically 
+        # interpolation is inverted compared to standard flow matching, but mathematically
         # equivalent and implied by Black et al. (2024)
-        t = time[:, None, None] 
-        x_t = t * noise + (1 - t) * actions 
-        v_t_target = noise - actions 
+        t = time[:, None, None]
+        x_t = t * noise + (1 - t) * actions
+        v_t_target = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images=images, img_masks=img_masks, lang_tokens=lang_tokens, lang_masks=lang_masks, state=state
@@ -851,129 +968,55 @@ class FlowMatching(nn.Module):
         padding_mask = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         attention_mask = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
-        att_pad_masks = create_attention_mask(padding_mask, attention_mask) 
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1 # basic position ids, which skip padding, not documented in the paper 
+        att_2d_masks = create_attention_mask(padding_mask, attention_mask)
+        position_ids = torch.cumsum(padding_mask, dim=1) - 1 # basic position ids, which skip padding, not documented in the paper
 
-        # During training perform only self-attention by 
-        # - projecting each tokens for VLM and AE separately
-        # - concatenate the VLM QKV with the AE QKV 
-        # - compute attention on concatenated QKV 
-        models = [self.get_vlm_model().text_model, self.expert]
-        model_layers = self.get_model_layers(models)
-        input_embs = [prefix_embs, suffix_embs]
+        _, suffix_out = self.forward_layers(
+            input_embs=[prefix_embs, suffix_embs],
+            position_ids=position_ids,
+            attn_mask=att_2d_masks,
+        )
 
-        for layer_idx in range(self.num_vlm_layers):
-            
-            output_embeds = []
-            attention_mask_, position_ids_ = adapt_mask_and_position_length(attention_mask, position_ids, query_states.shape[1])
-
-            if layer_idx % self.config.self_attn_every_n_layers == 0:
-
-                att_outputs, _ = self.self_attention(
-                    model_layers,
-                    layer_idx, 
-                    input_embs,
-                    position_ids,
-                    attention_mask,
-                    past_key_values=None,
-                    do_training=True
-                )
-
-                for i, hidden_states in enumerate(input_embs):
-                    layer = model_layers[i][layer_idx]
-                    if layer is None:
-                        output_embeds.append(hidden_states) # pass hidden_states to the next layer 
-                    else:
-                        output_embeds.append(self.post_attention_processing(
-                            layer,
-                            hidden_states,
-                            att_outputs[0]
-                        ))
-
-            else: 
-                att_outputs = self.cross_attention(
-                    model_layers, 
-                    layer_idx,
-                    input_embs,
-                    positions_ids,
-                    attention_mask,
-                    past_key_values
-                )
-
-                for i, hidden_states in enumerate(input_embs):
-                    layer = model_layers[i][layer_idx]
-                    if layer is None:
-                        output_embeds.append(hidden_states)
-                    else:
-                        output_embeds.append(self.post_attention_processing(
-                            layer=layer,
-                            first_residual=hidden_states,
-                            att_output=att_outputs[i]
-                        ))
-
-            input_embs = output_embeds
-
-        suffix_out = suffix_out[:, -self.config.chunk_size:] # remove the state tokens
+        suffix_out = suffix_out[:, -self.config.chunk_size:]
+        suffix_out = suffix_out.to(dtype=torch.float32)
 
         v_t_pred = self.action_out_proj(suffix_out)
         return F.mse_loss(v_t_target, v_t_pred, reduction="none")
-        
+
 
     def denoise_step(self, prefix_pad_masks, past_key_values, x_t, timestep):
-        
-        suffix_embs, suffix_pad_masks, suffix_masks = self.embed_suffix(x_t, timestep)
-        suffix_len =  suffix_pad_masks.shape[1]
+
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
+        suffix_len = suffix_pad_masks.shape[1]
         bsize, prefix_len = prefix_pad_masks.shape[:2]
-        prefix_pad_2d_masks = prefix_pad_masks.expand(bsize, suffix_len, prefix_len)
 
-        suffix_att_2d_masks = create_attention_mask(suffis_pad_masks, suffix_att_masks)
+        # The AE tokens may attend to every (non-padding) prefix token ...
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(bsize, suffix_len, prefix_len)
+        # ... and among themselves according to their attention mask
+        suffix_att_2d_masks = create_attention_mask(suffix_pad_masks, suffix_att_masks)
 
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dime=2)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
         prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
-        models = [self.get_vlm_model().text_model, self.lm_expert]
-        model_layers = self.get_model_layers(models)
+        _, suffix_out = self.forward_layers(
+            input_embs=[None, suffix_embs],
+            position_ids=position_ids,
+            attn_mask=full_att_2d_masks,
+            past_key_values=past_key_values,
+        )
 
-        for layer_idx in range(self.config.num_vlm_layers):
-            
-            layer = model_layers[1][layer_idx]
-            if layer_idx % self.config.every_n_layer_self_attn == 0:
-                att_outputs, past_key_values = self.self_attention(
-                    model_layer=layer,
-                    layer_idx=layer_idx, 
-                    input_embeds=suffix_embs,
-                    position_ids=positions_ids,
-                    attn_mask=full_att_2d_masks,
-                    past_key_values=past_key_values,
-                    do_training=False
-                )
-            else: 
-                att_outputs, past_key_values = self.cross_attention(
-                    model_layer=layer, 
-                    layer_idx=layer_idx,
-                    input_embeds=suffix_embs,
-                    position_ids=position_ids,
-                    attn_mask=full_att_2d_masks,
-                    past_key_values=past_key_values
-                )
-
-            # cross_attention returns [vlm_att_out, ae_att_out] and self attention [att_out]
-            # During inference only post process the last element inside the list
-            att_out = att_outputs[-1]
-            out_emb = self.post_attention_processing(
-                layer=layer,
-                first_residual=suffix_embs,
-                att_output=att_out
-            )
-            suffix_embs = out_emb
-
-        # Perform final layer normalization
-        return self.lm_expert.norm(suffix_embs)
-        
+        suffix_out = suffix_out[:, -self.config.chunk_size:]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+        return self.action_out_proj(suffix_out)
 
 
 
+    def euler_integration(self, noise, prefix_pad_masks, past_key_values):
+        # Integrate from t = 1 (pure noise) to t = 0 (clean actions)
+        bsize = noise.shape[0]
+        dt = -1.0 / self.config.num_steps
+        x_t = noise
 
         for step in range(self.config.num_steps):
             time = 1.0 + step * dt
